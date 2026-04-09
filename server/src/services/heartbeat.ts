@@ -707,6 +707,18 @@ export function shouldResetTaskSessionForWake(
   return false;
 }
 
+function shouldRequireIssueCommentForWake(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+) {
+  const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
+  return (
+    wakeReason === "issue_assigned" ||
+    wakeReason === "execution_review_requested" ||
+    wakeReason === "execution_approval_requested" ||
+    wakeReason === "execution_changes_requested"
+  );
+}
+
 export function formatRuntimeWorkspaceWarningLog(warning: string) {
   return {
     stream: "stdout" as const,
@@ -2033,6 +2045,17 @@ export function heartbeatService(db: Db) {
         message: "Run ended without an issue comment after one retry; no further comment wake will be queued",
       });
       return { outcome: "retry_exhausted" as const, queuedRun: null };
+    }
+
+    if (!shouldRequireIssueCommentForWake(contextSnapshot)) {
+      if (run.issueCommentStatus !== "not_applicable") {
+        await patchRunIssueCommentStatus(run.id, {
+          issueCommentStatus: "not_applicable",
+          issueCommentSatisfiedByCommentId: null,
+          issueCommentRetryQueuedAt: null,
+        });
+      }
+      return { outcome: "not_applicable" as const, queuedRun: null };
     }
 
     const queuedRun = await enqueueMissingIssueCommentRetry(run, agent, issueId);

@@ -96,6 +96,8 @@ export function OpenClawGatewayConfigFields({
     String(config.sessionKeyStrategy ?? "fixed"),
   );
 
+  const createModeToken = isCreate ? (values!.gatewayToken ?? "") : "";
+
   return (
     <>
       <Field label="Gateway URL" hint={help.webhookUrl}>
@@ -115,6 +117,15 @@ export function OpenClawGatewayConfigFields({
           placeholder="ws://127.0.0.1:18789"
         />
       </Field>
+
+      {isCreate && (
+        <SecretField
+          label="Gateway auth token (x-openclaw-token)"
+          value={createModeToken}
+          onCommit={(v) => set!({ gatewayToken: v })}
+          placeholder="OpenClaw gateway token"
+        />
+      )}
 
       <PayloadTemplateJsonField
         isCreate={isCreate}
@@ -232,6 +243,18 @@ export function OpenClawGatewayConfigFields({
               className={inputClass}
               placeholder="120000"
             />
+          </Field>
+
+          <Field label="Omit paperclip payload" hint="Enable if your OpenClaw version rejects the top-level 'paperclip' property in agent requests.">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={eff("adapterConfig", "omitPaperclipPayload", Boolean(config.omitPaperclipPayload)) === true}
+                onChange={(e) => mark("adapterConfig", "omitPaperclipPayload", e.target.checked || undefined)}
+                className="h-3.5 w-3.5"
+              />
+              <span className="text-xs text-muted-foreground">Skip sending Paperclip context to OpenClaw</span>
+            </label>
           </Field>
 
           <Field label="Device auth">

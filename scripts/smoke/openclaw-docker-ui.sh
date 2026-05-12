@@ -56,7 +56,7 @@ require_cmd grep
 
 OPENCLAW_REPO_URL="${OPENCLAW_REPO_URL:-https://github.com/openclaw/openclaw.git}"
 OPENCLAW_DOCKER_DIR="${OPENCLAW_DOCKER_DIR:-/tmp/openclaw-docker}"
-OPENCLAW_REPO_REF="${OPENCLAW_REPO_REF:-v2026.3.2}"
+OPENCLAW_REPO_REF="${OPENCLAW_REPO_REF:-v2026.5.7}"
 OPENCLAW_IMAGE="${OPENCLAW_IMAGE:-openclaw:local}"
 OPENCLAW_TMP_DIR="${OPENCLAW_TMP_DIR:-${TMPDIR:-/tmp}}"
 OPENCLAW_TMP_DIR="${OPENCLAW_TMP_DIR%/}"
@@ -100,9 +100,16 @@ fi
 
 [[ -n "${OPENAI_API_KEY:-}" ]] || fail "OPENAI_API_KEY is required (set env var or include it in $OPENCLAW_SECRETS_FILE)"
 
+# If OPENROUTER_API_KEY is not set explicitly, fall back to OPENAI_API_KEY so
+# that callers can pass a single OpenRouter key as OPENAI_API_KEY when using
+# openrouter/* model names.
+OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-$OPENAI_API_KEY}"
+
 log "preparing OpenClaw repo at $OPENCLAW_DOCKER_DIR"
 if [[ -d "$OPENCLAW_DOCKER_DIR/.git" ]]; then
   git -C "$OPENCLAW_DOCKER_DIR" fetch --quiet --tags origin || true
+  git -C "$OPENCLAW_DOCKER_DIR" reset --hard HEAD --quiet
+  git -C "$OPENCLAW_DOCKER_DIR" clean -fd --quiet || true
 else
   rm -rf "$OPENCLAW_DOCKER_DIR"
   git clone "$OPENCLAW_REPO_URL" "$OPENCLAW_DOCKER_DIR"
@@ -161,7 +168,8 @@ cat > "$OPENCLAW_CONFIG_DIR/openclaw.json" <<EOF
     }
   },
   "env": {
-    "OPENAI_API_KEY": "${OPENAI_API_KEY}"
+    "OPENAI_API_KEY": "${OPENAI_API_KEY}",
+    "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"
   },
   "agents": {
     "defaults": {

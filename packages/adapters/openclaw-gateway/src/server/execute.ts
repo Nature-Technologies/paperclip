@@ -1105,6 +1105,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const scopes = normalizeScopes(ctx.config.scopes);
   const deviceFamily = nonEmpty(ctx.config.deviceFamily);
   const disableDeviceAuth = parseBoolean(ctx.config.disableDeviceAuth, false);
+  const omitPaperclipPayload = parseBoolean(ctx.config.omitPaperclipPayload, false);
 
   const wakePayload = buildWakePayload(ctx);
   const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload);
@@ -1139,7 +1140,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     idempotencyKey: ctx.runId,
   };
   delete agentParams.text;
-  agentParams.paperclip = paperclipPayload;
+  if (!omitPaperclipPayload) {
+    agentParams.paperclip = paperclipPayload;
+  }
 
   const configuredAgentId = nonEmpty(ctx.config.agentId);
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {

@@ -491,6 +491,7 @@ export interface CreateConfigValues {
   url: string;
   bootstrapPrompt: string;
   payloadTemplateJson?: string;
+  gatewayToken?: string;
   workspaceStrategyType?: string;
   workspaceBaseRef?: string;
   workspaceBranchTemplate?: string;

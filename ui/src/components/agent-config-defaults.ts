@@ -20,6 +20,7 @@ export const defaultCreateValues: CreateConfigValues = {
   url: "",
   bootstrapPrompt: "",
   payloadTemplateJson: "",
+  gatewayToken: "",
   workspaceStrategyType: "project_primary",
   workspaceBaseRef: "",
   workspaceBranchTemplate: "",

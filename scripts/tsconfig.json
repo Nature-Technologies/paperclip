@@ -1,0 +1,9 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "typeRoots": ["../server/node_modules/@types"],
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["."]
+}

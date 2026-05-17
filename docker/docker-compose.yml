@@ -19,6 +19,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+    image: ghcr.io/nature-technologies/paperclip:${TAG-latest}
     ports:
       - "3100:3100"
     environment:

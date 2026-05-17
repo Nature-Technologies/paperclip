@@ -312,6 +312,39 @@ This starts the API server at `http://localhost:3100`. An embedded PostgreSQL da
 
 <br/>
 
+## Build And Push Server Image To GHCR
+
+Use this flow when you want to build the server image locally and publish it to GitHub Container Registry.
+
+1. Set the image tag and runtime secret before building.
+
+```bash
+export TAG=dev-0.2
+export BETTER_AUTH_SECRET="$(openssl rand -hex 32)"
+```
+
+2. Make sure you know your GitHub username, then create a GitHub personal access token (classic) with `read:packages` and `write:packages` permissions.
+
+3. Log in to GHCR with Docker.
+
+```bash
+echo "$GHCR_PAT" | docker login ghcr.io -u "<your-github-username>" --password-stdin
+```
+
+4. Build the server image.
+
+```bash
+docker compose -f docker/docker-compose.yml build server
+```
+
+5. Push the server image to GHCR.
+
+```bash
+docker compose -f docker/docker-compose.yml push server
+```
+
+<br/>
+
 ## FAQ
 
 **What does a typical setup look like?**

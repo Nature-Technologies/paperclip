@@ -261,6 +261,14 @@ export interface HireApprovedPayload {
   approvedAt: string;
   /** Canonical operator-facing message for cloud adapters to show the user. */
   message: string;
+  /**
+   * Fresh one-time claim secret for autonomous API key claiming.
+   * Set only when source is "join_request" and the API key has not yet been claimed.
+   * The adapter should use this to instruct the remote agent to call the claim endpoint.
+   */
+  freshClaimSecret?: string;
+  /** Join request ID — same as sourceId when source is "join_request", provided for clarity. */
+  joinRequestId?: string;
 }
 
 /** Result of onHireApproved hook; failures are non-fatal to the approval flow. */

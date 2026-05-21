@@ -1,6 +1,7 @@
+import { createHash, randomBytes } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents } from "@paperclipai/db";
+import { agentApiKeys, agents, joinRequests } from "@paperclipai/db";
 import type { HireApprovedPayload } from "@paperclipai/adapter-utils";
 import { findActiveServerAdapter } from "../adapters/registry.js";
 import { logger } from "../middleware/logger.js";
@@ -46,6 +47,48 @@ export async function notifyHireApproved(
     return;
   }
 
+  // For join_request approvals, generate a fresh claim secret if the API key
+  // has not been claimed yet so the adapter can autonomously trigger claiming.
+  let freshClaimSecret: string | undefined;
+  let joinRequestId: string | undefined;
+  if (source === "join_request") {
+    try {
+      const joinRequest = await db
+        .select()
+        .from(joinRequests)
+        .where(eq(joinRequests.id, sourceId))
+        .then((rows) => rows[0] ?? null);
+
+      if (joinRequest?.createdAgentId && !joinRequest.claimSecretConsumedAt) {
+        const existingKey = await db
+          .select({ id: agentApiKeys.id })
+          .from(agentApiKeys)
+          .where(eq(agentApiKeys.agentId, joinRequest.createdAgentId))
+          .then((rows) => rows[0] ?? null);
+
+        if (!existingKey) {
+          const secret = `pcp_claim_${randomBytes(24).toString("hex")}`;
+          const secretHash = createHash("sha256").update(secret).digest("hex");
+          await db
+            .update(joinRequests)
+            .set({
+              claimSecretHash: secretHash,
+              claimSecretExpiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+              updatedAt: new Date(),
+            })
+            .where(eq(joinRequests.id, sourceId));
+          freshClaimSecret = secret;
+          joinRequestId = sourceId;
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { err, companyId, agentId, sourceId },
+        "hire hook: failed to generate fresh claim secret, adapter will receive no freshClaimSecret",
+      );
+    }
+  }
+
   const payload: HireApprovedPayload = {
     companyId,
     agentId,
@@ -55,6 +98,8 @@ export async function notifyHireApproved(
     sourceId,
     approvedAt: approvedAt.toISOString(),
     message: HIRE_APPROVED_MESSAGE,
+    ...(freshClaimSecret !== undefined && { freshClaimSecret }),
+    ...(joinRequestId !== undefined && { joinRequestId }),
   };
 
   const adapterConfig =

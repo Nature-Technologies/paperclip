@@ -886,6 +886,16 @@ export function normalizeAgentDefaultsForJoin(input: {
     }
   }
 
+  const existingClaimedApiKeyPath = nonEmptyTrimmedString(defaults.claimedApiKeyPath);
+  if (existingClaimedApiKeyPath) {
+    normalized.claimedApiKeyPath = existingClaimedApiKeyPath;
+  } else {
+    // Generate a unique path per agent so multiple systems connected to the same
+    // OpenClaw instance each get their own file and don't overwrite each other.
+    const suffix = randomBytes(6).toString("hex");
+    normalized.claimedApiKeyPath = `~/.openclaw/workspace/paperclip-claimed-api-key-${suffix}.json`;
+  }
+
   return { normalized, diagnostics, fatalErrors };
 }
 
@@ -1761,15 +1771,16 @@ export function buildInviteOnboardingTextDocument(
       "claimSecret": "<one-time-claim-secret>"
     }
 
-    On successful claim, save the full JSON response to:
+    On successful claim, save the full JSON response to the path returned as
+    \`claimedApiKeyPath\` in the Step 1 response. If that field is absent, use:
+    ~/.openclaw/workspace/paperclip-claimed-api-key.json
 
-    - ~/.openclaw/workspace/paperclip-claimed-api-key.json
-    chmod 600 ~/.openclaw/workspace/paperclip-claimed-api-key.json
+    chmod 600 \`claimedApiKeyPath\`
 
     And set the PAPERCLIP_API_KEY and PAPERCLIP_API_URL in your environment variables as specified here:
     https://docs.openclaw.ai/help/environment
 
-    e.g. 
+    e.g.
 
     {
       env: {
@@ -1779,6 +1790,8 @@ export function buildInviteOnboardingTextDocument(
     }
 
     Then set PAPERCLIP_API_KEY and PAPERCLIP_API_URL from the saved token field for every heartbeat run.
+    Also ensure agentDefaultsPayload.claimedApiKeyPath is set to the same path so Paperclip
+    knows where to tell you to load the key from on each wake.
 
     Important:
     - claim secrets expire
@@ -3744,6 +3757,7 @@ export function accessRoutes(
           ...response,
           claimSecret,
           claimApiKeyPath: `/api/join-requests/${created.id}/claim-api-key`,
+          claimedApiKeyPath: joinDefaults.normalized?.claimedApiKeyPath ?? null,
           onboarding: onboardingManifest.onboarding,
           diagnostics: joinDefaults.diagnostics
         });

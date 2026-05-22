@@ -1,12 +1,21 @@
 import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
-import type { HireApprovedPayload, HireApprovedHookResult } from "@paperclipai/adapter-utils";
+import type {
+  HireApprovedPayload,
+  HireApprovedHookResult,
+} from "@paperclipai/adapter-utils";
 
 const PROTOCOL_VERSION = 4;
 const CONNECT_TIMEOUT_MS = 30_000;
 
 type ReqFrame = { type: "req"; id: string; method: string; params?: unknown };
-type ResFrame = { type: "res"; id: string; ok: boolean; payload?: unknown; error?: { code?: unknown; message?: unknown } };
+type ResFrame = {
+  type: "res";
+  id: string;
+  ok: boolean;
+  payload?: unknown;
+  error?: { code?: unknown; message?: unknown };
+};
 type EventFrame = { type: "event"; event: string; payload?: unknown };
 
 function asRecord(v: unknown): Record<string, unknown> | null {
@@ -36,12 +45,22 @@ function rawBytes(data: unknown): string {
   return String(data);
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`timeout: ${label}`)), ms);
     promise.then(
-      (v) => { clearTimeout(t); resolve(v); },
-      (e) => { clearTimeout(t); reject(e); },
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
     );
   });
 }
@@ -60,9 +79,15 @@ async function sendClaimWake(opts: {
   freshClaimSecret: string;
   claimedApiKeyPath: string;
 }): Promise<void> {
-  const ws = new WebSocket(opts.url, { headers: opts.headers, maxPayload: 4 * 1024 * 1024 });
+  const ws = new WebSocket(opts.url, {
+    headers: opts.headers,
+    maxPayload: 4 * 1024 * 1024,
+  });
 
-  const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  const pending = new Map<
+    string,
+    { resolve: (v: unknown) => void; reject: (e: Error) => void }
+  >();
   let resolveChallenge!: (nonce: string) => void;
   let rejectChallenge!: (e: Error) => void;
   const challengePromise = new Promise<string>((res, rej) => {
@@ -73,7 +98,9 @@ async function sendClaimWake(opts: {
 
   function send(method: string, params: unknown): Promise<unknown> {
     const id = randomUUID();
-    ws.send(JSON.stringify({ type: "req", id, method, params } satisfies ReqFrame));
+    ws.send(
+      JSON.stringify({ type: "req", id, method, params } satisfies ReqFrame),
+    );
     return new Promise((resolve, reject) => {
       pending.set(id, { resolve, reject });
     });
@@ -87,7 +114,11 @@ async function sendClaimWake(opts: {
 
   ws.on("message", (data) => {
     let parsed: unknown;
-    try { parsed = JSON.parse(rawBytes(data)); } catch { return; }
+    try {
+      parsed = JSON.parse(rawBytes(data));
+    } catch {
+      return;
+    }
 
     const rec = asRecord(parsed);
     if (!rec) return;
@@ -110,9 +141,13 @@ async function sendClaimWake(opts: {
         entry.resolve(frame.payload ?? null);
       } else {
         const errRec = asRecord(frame.error);
-        entry.reject(new Error(
-          nonEmpty(errRec?.message) ?? nonEmpty(errRec?.code) ?? "gateway request failed"
-        ));
+        entry.reject(
+          new Error(
+            nonEmpty(errRec?.message) ??
+              nonEmpty(errRec?.code) ??
+              "gateway request failed",
+          ),
+        );
       }
     }
   });
@@ -125,45 +160,58 @@ async function sendClaimWake(opts: {
     failAll(err instanceof Error ? err : new Error(String(err)));
   });
 
-  // Wait for socket open
-  await withTimeout(
-    new Promise<void>((resolve, reject) => {
-      ws.once("open", resolve);
-      ws.once("error", reject);
-      ws.once("close", (code) => reject(new Error(`closed before open (${code})`)));
-    }),
-    CONNECT_TIMEOUT_MS,
-    "websocket open",
-  );
+  try {
+    // Wait for socket open
+    await withTimeout(
+      new Promise<void>((resolve, reject) => {
+        ws.once("open", resolve);
+        ws.once("error", reject);
+        ws.once("close", (code) =>
+          reject(new Error(`closed before open (${code})`)),
+        );
+      }),
+      CONNECT_TIMEOUT_MS,
+      "websocket open",
+    );
 
-  // Wait for challenge then connect
-  const nonce = await withTimeout(challengePromise, CONNECT_TIMEOUT_MS, "connect challenge");
-  await withTimeout(
-    send("connect", {
-      minProtocol: PROTOCOL_VERSION,
-      maxProtocol: PROTOCOL_VERSION,
-      client: { id: "gateway-client", version: "paperclip", platform: process.platform, mode: "backend" },
-      role: "operator",
-      scopes: ["operator.admin"],
-      auth: { token: opts.gatewayToken },
-      nonce,
-    }),
-    CONNECT_TIMEOUT_MS,
-    "connect",
-  );
+    // Wait for challenge then connect
+    const nonce = await withTimeout(
+      challengePromise,
+      CONNECT_TIMEOUT_MS,
+      "connect challenge",
+    );
+    await withTimeout(
+      send("connect", {
+        minProtocol: PROTOCOL_VERSION,
+        maxProtocol: PROTOCOL_VERSION,
+        client: {
+          id: "gateway-client",
+          version: "paperclip",
+          platform: process.platform,
+          mode: "backend",
+        },
+        role: "operator",
+        scopes: ["operator.admin"],
+        auth: { token: opts.gatewayToken },
+        nonce,
+      }),
+      CONNECT_TIMEOUT_MS,
+      "connect",
+    );
 
-  const message = buildClaimMessage(opts);
-  await withTimeout(
-    send("agent", {
-      message,
-      idempotencyKey: `paperclip-claim-${opts.agentId}`,
-      sessionKey: `paperclip-claim-${opts.agentId.slice(0, 8)}`,
-    }),
-    CONNECT_TIMEOUT_MS,
-    "agent send",
-  );
-
-  ws.close(1000, "paperclip-claim-sent");
+    const message = buildClaimMessage(opts);
+    await withTimeout(
+      send("agent", {
+        message,
+        idempotencyKey: `paperclip-claim-${opts.agentId}`,
+        sessionKey: `paperclip-claim-${opts.agentId.slice(0, 8)}`,
+      }),
+      CONNECT_TIMEOUT_MS,
+      "agent send",
+    );
+  } finally {
+    ws.close(1000, "paperclip-claim-finished");
+  }
 }
 
 function buildClaimMessage(opts: {
@@ -183,7 +231,7 @@ function buildClaimMessage(opts: {
     "Headers: Content-Type: application/json",
     `Body: {"claimSecret":"${opts.freshClaimSecret}"}`,
     "",
-    "Expected response: HTTP 201 with JSON body containing { \"keyId\", \"token\", \"agentId\", \"createdAt\" }",
+    'Expected response: HTTP 201 with JSON body containing { "keyId", "token", "agentId", "createdAt" }',
     "",
     "## Step 2: Save the API key",
     "",
@@ -221,17 +269,28 @@ export async function onHireApproved(
   const gatewayToken =
     headers["x-openclaw-token"] ??
     headers["x-openclaw-auth"] ??
-    Object.entries(headers).find(([k]) => k.toLowerCase() === "x-openclaw-token")?.[1] ??
-    Object.entries(headers).find(([k]) => k.toLowerCase() === "x-openclaw-auth")?.[1] ??
+    Object.entries(headers).find(
+      ([k]) => k.toLowerCase() === "x-openclaw-token",
+    )?.[1] ??
+    Object.entries(headers).find(
+      ([k]) => k.toLowerCase() === "x-openclaw-auth",
+    )?.[1] ??
     null;
 
   if (!gatewayToken) {
-    return { ok: false, error: "adapter config missing x-openclaw-token header" };
+    return {
+      ok: false,
+      error: "adapter config missing x-openclaw-token header",
+    };
   }
 
   const paperclipApiUrl = nonEmpty(adapterConfig.paperclipApiUrl);
   if (!paperclipApiUrl) {
-    return { ok: false, error: "adapter config missing paperclipApiUrl — cannot instruct agent where to call claim endpoint" };
+    return {
+      ok: false,
+      error:
+        "adapter config missing paperclipApiUrl — cannot instruct agent where to call claim endpoint",
+    };
   }
 
   const claimedApiKeyPath =

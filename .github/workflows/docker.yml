@@ -126,7 +126,7 @@ jobs:
           # the Dockerfile now declares a later `cloud` stage, and without a
           # target the default would silently become that stage.
           target: production
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -164,7 +164,7 @@ jobs:
           # the variant; add here when managed deployments need another.
           build-args: |
             CLOUD_BUNDLED_PLUGINS=daytona
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max

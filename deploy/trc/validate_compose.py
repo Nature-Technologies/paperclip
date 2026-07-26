@@ -128,6 +128,144 @@ def check_compose_renders() -> None:
     )
 
 
+WORKFLOW = HERE.parents[1] / ".github" / "workflows" / "trc-staging-deploy.yml"
+
+
+def _run_script_lines(doc: dict) -> list[str]:
+    """Every executable line of every `run:` block, full-line shell comments dropped.
+
+    Assertions about script behaviour cannot match the raw file text: these
+    scripts document the rules they follow, so a comment saying "never set -x"
+    reads as a violation and a comment saying "serialize on flock" reads as
+    compliance. Only executable lines carry either meaning.
+    """
+    lines: list[str] = []
+    for job in (doc.get("jobs") or {}).values():
+        for step in ((job or {}).get("steps") or []):
+            script = (step or {}).get("run")
+            if not script:
+                continue
+            lines += [
+                ln for ln in script.splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")
+            ]
+    return lines
+
+
+def _set_words(line: str) -> list[str] | None:
+    """The option words of a `set ...` line, or None if the line is not one."""
+    match = re.match(r"^\s*set\s+(-.*)$", line)
+    return match.group(1).split() if match else None
+
+
+def _enables_tracing(line: str) -> bool:
+    words = _set_words(line)
+    if words is None:
+        return False
+    for index, word in enumerate(words):
+        if word == "-o":
+            if index + 1 < len(words) and words[index + 1] == "xtrace":
+                return True
+            continue
+        if word.startswith("-") and "x" in word.lstrip("-"):
+            return True
+    return False
+
+
+def _strict_mode_chars(line: str) -> set[str]:
+    """Short-option letters enabled by a `set ...` line, ignoring `-o name`."""
+    words = _set_words(line)
+    if words is None:
+        return set()
+    chars: set[str] = set()
+    skip = False
+    for word in words:
+        if skip:
+            skip = False
+            continue
+        if word == "-o":
+            skip = True
+            continue
+        if word.startswith("-"):
+            chars |= set(word.lstrip("-"))
+    return chars
+
+
+def check_deploy_workflow() -> None:
+    """Assert the deploy workflow's security and reproducibility invariants.
+
+    These are properties a generic YAML linter cannot know about: the digest
+    pin that makes rollback a re-dispatch, the host-side mutex that stands in
+    for a cross-repository concurrency group, the two ways this workflow could
+    leak or weaken credentials, and the one specific to this repo -- the
+    deploy must never create the /paperclip bind mount, because an empty
+    directory would let Paperclip bootstrap a fresh unclaimed instance over
+    data that should have been migrated.
+    """
+    check(WORKFLOW.is_file(), f"missing {WORKFLOW}")
+    if not WORKFLOW.is_file():
+        return
+    raw = WORKFLOW.read_text(encoding="utf-8")
+    doc = yaml.safe_load(raw)
+
+    # YAML 1.1 parses the bare key `on` as the boolean True, so read both
+    # spellings rather than guessing which one PyYAML lands on.
+    triggers = doc.get("on", doc.get(True)) or {}
+    check(
+        set(triggers) == {"workflow_dispatch"},
+        "deploy must be workflow_dispatch only -- auto-deploy was explicitly "
+        f"rejected; got triggers {sorted(str(t) for t in triggers)}",
+    )
+    inputs = ((triggers.get("workflow_dispatch") or {}).get("inputs")) or {}
+    check(
+        "image_digest" in inputs,
+        "workflow_dispatch must take an `image_digest` input",
+    )
+    check(
+        bool((inputs.get("image_digest") or {}).get("required")),
+        "`image_digest` must be required -- deploys are digest-pinned so that "
+        "rollback is a re-dispatch with the previous digest",
+    )
+    script_lines = _run_script_lines(doc)
+
+    traced = [ln.strip() for ln in script_lines if _enables_tracing(ln)]
+    check(
+        not traced,
+        f"shell tracing is enabled by {traced} -- tracing prints every secret "
+        "into the run log. This catches `set -x`, `set -eux`, `set -xe`, "
+        "`set -e -u -x` and `set -o xtrace`, while leaving `set -o pipefail` "
+        "alone",
+    )
+    check(
+        any({"e", "u"} <= _strict_mode_chars(ln) for ln in script_lines),
+        "no `run:` block enables strict mode -- at least one must set both -e "
+        "and -u",
+    )
+    check(
+        any("flock" in ln for ln in script_lines),
+        "no `run:` block calls flock: three repositories deploy into one host "
+        "and a GitHub concurrency group cannot span repositories",
+    )
+    check(
+        "StrictHostKeyChecking=no" not in raw
+        and "StrictHostKeyChecking no" not in raw,
+        "host keys must be pinned via TRC_SSH_KNOWN_HOSTS, not bypassed",
+    )
+
+    created = [
+        ln.strip()
+        for ln in script_lines
+        if re.search(r"\bmkdir\b[^\n]*paperclip-home", ln)
+    ]
+    check(
+        not created,
+        f"the deploy must NOT create the /paperclip bind mount, but {created} "
+        "does. An empty directory lets Paperclip bootstrap a fresh unclaimed "
+        "instance over data that should have been migrated, and that directory "
+        "holds secrets/master.key and the only copy of the hermes_gateway wiring",
+    )
+
+
 def report() -> int:
     if failures:
         print(f"{len(failures)} check(s) failed:", file=sys.stderr)
@@ -217,6 +355,7 @@ def main() -> int:
 
     check_env_example_declares_every_reference()
     check_compose_renders()
+    check_deploy_workflow()
     return report()
 
 

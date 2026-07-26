@@ -1,0 +1,44 @@
+name: TRC deploy checks
+
+# Additive and TRC-only. Validates deploy/trc/ with no server contact and no
+# secrets, so it is safe on any branch and on pull requests.
+
+on:
+  push:
+    branches: [chore/new-ci]
+    paths:
+      - 'deploy/trc/**'
+      - '.github/workflows/trc-*.yml'
+  pull_request:
+    paths:
+      - 'deploy/trc/**'
+      - '.github/workflows/trc-*.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trc-deploy-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate TRC staging deploy assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install PyYAML
+        run: pip install 'pyyaml==6.0.3'
+
+      # ubuntu-latest ships the docker CLI and compose plugin, which the
+      # validator needs for `docker compose config`. No pnpm install is needed:
+      # these checks read files, they do not build the app.
+      - name: Run contract checks
+        run: python deploy/trc/validate_compose.py

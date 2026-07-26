@@ -1,0 +1,233 @@
+name: TRC staging deploy (paperclip)
+
+# Additive and TRC-only. Does NOT build or publish -- docker.yml already does
+# that. This rolls an already-published digest onto the staging host.
+#
+# Manual by design, and deliberately deferrable: bringing Paperclip up is not
+# required to unblock chat.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: 'Digest to deploy, e.g. sha256:<64 hex>. Tags are rejected.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Stops this repository overlapping itself. Cross-repository races are
+  # handled by the flock on the host, because a concurrency group cannot span
+  # repositories.
+  group: trc-staging-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy paperclip to staging
+    if: github.repository == 'Nature-Technologies/paperclip'
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate digest
+        env:
+          DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -eu
+          hex="${DIGEST#sha256:}"
+          if [ "$hex" = "$DIGEST" ]; then
+            echo "::error::image_digest must start with sha256:"; exit 1
+          fi
+          if [ "${#hex}" -ne 64 ]; then
+            echo "::error::image_digest must be sha256: plus 64 hex chars"; exit 1
+          fi
+          case "$hex" in
+            *[!0-9a-f]*)
+              echo "::error::digest hex must be lowercase 0-9a-f"; exit 1 ;;
+          esac
+
+      - name: Install SSH key and pin host key
+        env:
+          SSH_KEY: ${{ secrets.TRC_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.TRC_SSH_KNOWN_HOSTS }}
+        run: |
+          set -eu
+          if [ -z "$KNOWN_HOSTS" ]; then
+            echo "::error::TRC_SSH_KNOWN_HOSTS is empty. Host keys are pinned, not bypassed."
+            exit 1
+          fi
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Copy deploy artifacts
+        env:
+          SSH_HOST: ${{ secrets.TRC_SSH_HOST }}
+          SSH_USER: ${{ secrets.TRC_SSH_USER }}
+          SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
+        run: |
+          set -eu
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            'mkdir -p /srv/trc/staging/paperclip /srv/trc/staging/fingerprints'
+          scp -i ~/.ssh/id_deploy -P "$SSH_PORT" \
+            deploy/trc/docker-compose-staging-trc.yml \
+            "$SSH_USER@$SSH_HOST:/srv/trc/staging/paperclip/"
+
+      - name: Render .env and deploy
+        env:
+          SSH_HOST: ${{ secrets.TRC_SSH_HOST }}
+          SSH_USER: ${{ secrets.TRC_SSH_USER }}
+          SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
+          DIGEST: ${{ inputs.image_digest }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          BETTER_AUTH_SECRET: ${{ secrets.BETTER_AUTH_SECRET }}
+          SIGNING_SECRET: ${{ secrets.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PAPERCLIP_PUBLIC_URL: ${{ secrets.PAPERCLIP_PUBLIC_URL }}
+          GHCR_READ_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+        run: |
+          set -eu
+          # Never `set -x` in this step: it would print every secret below.
+
+          case "$PAPERCLIP_PUBLIC_URL" in
+            ""|*localhost*|*127.0.0.1*)
+              echo "::error::PAPERCLIP_PUBLIC_URL must be the external URL a browser can reach from outside the host. It is baked into auth callbacks and shown to the first admin, so a localhost value is wrong on a server."
+              exit 1 ;;
+          esac
+
+          case "$POSTGRES_PASSWORD" in
+            ""|*[@:/?#]*)
+              echo "::error::POSTGRES_PASSWORD must be non-empty and must not contain @ : / ? or #. It is interpolated into DATABASE_URL, where those characters silently corrupt the connection string with no error from compose. Use: openssl rand -hex 32"
+              exit 1 ;;
+          esac
+
+          # Not yet parameterised via a secret (see PAPERCLIP_HOME_DIR below),
+          # but guarded anyway: a relative path would silently resolve against
+          # whatever directory compose is invoked from on the host.
+          PAPERCLIP_HOME_DIR=/srv/trc/staging/paperclip-home
+          case "$PAPERCLIP_HOME_DIR" in
+            /*) ;;
+            *) echo "::error::PAPERCLIP_HOME_DIR must be an absolute path"; exit 1 ;;
+          esac
+
+          umask 077
+          {
+            printf 'PAPERCLIP_IMAGE=ghcr.io/nature-technologies/paperclip@%s\n' "$DIGEST"
+            printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
+            printf 'BETTER_AUTH_SECRET=%s\n' "$BETTER_AUTH_SECRET"
+            printf 'PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=%s\n' "$SIGNING_SECRET"
+            printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY"
+            printf 'PAPERCLIP_PUBLIC_URL=%s\n' "$PAPERCLIP_PUBLIC_URL"
+            printf 'PAPERCLIP_HOME_DIR=%s\n' "$PAPERCLIP_HOME_DIR"
+            printf 'PAPERCLIP_BIND=0.0.0.0\n'
+          } > env.staging
+          scp -i ~/.ssh/id_deploy -P "$SSH_PORT" env.staging \
+            "$SSH_USER@$SSH_HOST:/srv/trc/staging/paperclip/.env"
+          rm -f env.staging
+
+          if [ -n "$GHCR_READ_TOKEN" ]; then
+            printf '%s' "$GHCR_READ_TOKEN" | ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" \
+              "$SSH_USER@$SSH_HOST" \
+              'docker login ghcr.io -u trc-deploy --password-stdin'
+          fi
+
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" 'bash -s' <<'REMOTE'
+          set -eu
+          cd /srv/trc/staging/paperclip
+          chmod 600 .env
+
+          # Deliberately NOT created here. An empty directory lets Paperclip
+          # bootstrap a fresh unclaimed instance over data that should have
+          # been migrated, and this directory holds secrets/master.key and the
+          # only copy of the hermes_gateway wiring. It is provisioned once, by
+          # hand, during the Phase 2 migration.
+          if [ ! -d /srv/trc/staging/paperclip-home ]; then
+            echo "/srv/trc/staging/paperclip-home does not exist."
+            echo "Provision it during the Phase 2 migration -- do not let this deploy create it."
+            exit 1
+          fi
+          owner="$(stat -c '%u' /srv/trc/staging/paperclip-home)"
+          if [ "$owner" != "1000" ]; then
+            echo "/srv/trc/staging/paperclip-home is owned by UID $owner, expected 1000."
+            echo "Bind mounts carry host ownership straight through and the container runs as node=1000, so the first write to /paperclip would fail with EACCES and the container would crash-loop."
+            exit 1
+          fi
+
+          docker network create poc-net 2>/dev/null || true
+          docker volume create trc-staging-paperclip-db >/dev/null
+
+          # Record the rollback target. Read the digest from the IMAGE, not the
+          # container: a container's inspect output has no RepoDigests key at
+          # all, so `docker inspect <container>` cannot produce this.
+          if img="$(docker inspect --format '{{.Image}}' paperclip 2>/dev/null)"; then
+            echo "rollback target (digest currently running):"
+            docker image inspect "$img" \
+              --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}(built locally, no digest){{end}}'
+          else
+            echo "no paperclip container running yet"
+          fi
+
+          flock /var/lock/trc-deploy.lock -c 'set -e
+            cd /srv/trc/staging/paperclip
+            docker compose -f docker-compose-staging-trc.yml pull
+            docker compose -f docker-compose-staging-trc.yml up -d --remove-orphans
+          '
+          REMOTE
+
+      - name: Smoke test
+        env:
+          SSH_HOST: ${{ secrets.TRC_SSH_HOST }}
+          SSH_USER: ${{ secrets.TRC_SSH_USER }}
+          SSH_PORT: ${{ secrets.TRC_SSH_PORT || '22' }}
+        run: |
+          set -eu
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" 'bash -s' <<'REMOTE'
+          set -eu
+          docker exec paperclip-postgres pg_isready -U paperclip
+          echo "postgres OK"
+
+          ok=0
+          for i in $(seq 1 45); do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+                      http://127.0.0.1:3100/ || echo 000)"
+            case "$code" in
+              2*|3*) ok=1; break ;;
+            esac
+            sleep 2
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "paperclip never answered on :3100 (last status ${code:-none})"
+            docker logs --tail 50 paperclip || true
+            exit 1
+          fi
+          echo "paperclip OK (HTTP $code)"
+
+          # Third copy of HERMES_API_KEY. It lives in the instance config.json,
+          # which is read-only after claiming, so CI cannot set it -- only
+          # detect drift. Fingerprints are compared rather than secrets, and
+          # the scan is schema-agnostic on purpose: the config's shape is not a
+          # stable contract. Warn only; this copy is not CI's to repair.
+          fpr=/srv/trc/staging/fingerprints/hermes-api-key
+          cfg=/srv/trc/staging/paperclip-home/instances/default/config.json
+          if [ ! -f "$fpr" ]; then
+            echo "::warning::no hermes-agent fingerprint at $fpr -- deploy trc-hermes-agent first to enable this check."
+          elif [ ! -f "$cfg" ]; then
+            echo "::warning::no instance config at $cfg -- the instance may not be claimed yet, so its hermes_gateway wiring cannot be verified."
+          else
+            want="$(cat "$fpr")"
+            if grep -oE '"[A-Za-z0-9_-]{16,}"' "$cfg" \
+                 | tr -d '"' \
+                 | while read -r v; do printf '%s' "$v" | sha256sum | cut -c1-12; done \
+                 | grep -qx "$want"; then
+              echo "paperclip's hermes_gateway key matches hermes-agent"
+            else
+              echo "::warning::no value in $cfg matches hermes-agent's HERMES_API_KEY fingerprint. Paperclip's gateway calls will be rejected with 401 while chat keeps working. That file is read-only after claiming, so fixing it is a manual step."
+            fi
+          fi
+          REMOTE

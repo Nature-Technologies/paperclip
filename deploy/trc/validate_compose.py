@@ -227,6 +227,24 @@ def _step_with_run_containing(doc: dict, needle: str) -> dict | None:
     return None
 
 
+HEREDOC_RE = re.compile(r"<<-?\s*'?[A-Za-z_][A-Za-z0-9_]*'?\s*$")
+
+
+def _docker_exec_is_interactive(line: str) -> bool:
+    """True when the `docker exec` on this line passes an -i style flag.
+
+    Flags are the dash-prefixed tokens between `docker exec` and the container
+    name, so `-i`, `-it` and `-ti` all count.
+    """
+    after = line.split("docker exec", 1)[1].split()
+    for token in after:
+        if not token.startswith("-"):
+            break
+        if "i" in token.lstrip("-"):
+            return True
+    return False
+
+
 def check_deploy_workflow() -> None:
     """Assert the deploy workflow's security and reproducibility invariants.
 
@@ -393,6 +411,27 @@ def check_deploy_workflow() -> None:
         "`compose pull` must precede `compose up -d`, or a deploy can silently "
         "run a stale image already present on the host",
     )
+
+    # The defect class that has cost this project the most, shipped twice in
+    # Phase 1. A `docker exec` fed a heredoc WITHOUT -i gets no stdin, so
+    # `python3 -` reads EOF, the body never runs, and the step exits 0 -- a
+    # smoke test that silently tests nothing. The inverse bites too: -i on a
+    # call that is not heredoc-fed makes it swallow the enclosing script's
+    # remaining lines. All three repos are correct today; this keeps them so.
+    # `_run_script_lines` drops full-line comments, so prose mentioning
+    # `docker exec` cannot trip this.
+    for ln in script_lines:
+        if "docker exec" not in ln:
+            continue
+        fed = bool(HEREDOC_RE.search(ln))
+        interactive = _docker_exec_is_interactive(ln)
+        check(
+            fed == interactive,
+            f"`docker exec` mismatch on: {ln.strip()!r} -- a heredoc-fed call "
+            "MUST pass -i or no stdin reaches the container, the body never "
+            "runs and the step exits 0; a call that is NOT heredoc-fed must "
+            "NOT pass -i, or it consumes the rest of the enclosing script",
+        )
 
 
 def report() -> int:

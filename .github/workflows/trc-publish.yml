@@ -12,8 +12,13 @@ on:
   push:
     branches: [dev, chore/new-ci]
     paths-ignore:
+      # Top level only -- NEVER '**/*.md'. The whole repo is the build context,
+      # so a nested .md can be image content; '**/*.md' would skip a push that
+      # changes the image, nothing publishes, and the next deploy silently rolls
+      # the PREVIOUS :dev image while reporting success. Kept identical across
+      # the three TRC repos, where it is a live bug in trc-hermes-agent.
       - 'docs/**'
-      - '**/*.md'
+      - '*.md'
   workflow_dispatch:
 
 permissions:

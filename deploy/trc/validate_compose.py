@@ -304,6 +304,61 @@ def _writes_default_ssh_key(line: str) -> bool:
     return "~/.ssh/id_rsa" in line
 
 
+def _runs_on_labels(job: dict) -> list[str]:
+    """The runner labels a job requests, in all three valid spellings.
+
+    `runs-on: self-hosted` (scalar), `runs-on: [self-hosted, linux]` (list) and
+    `runs-on: {group: g, labels: [self-hosted, linux]}` (mapping) all mean the
+    same thing, so all three have to be read or a reformat could quietly turn
+    the assertion off.
+    """
+    runs_on = (job or {}).get("runs-on")
+    if isinstance(runs_on, str):
+        return [runs_on]
+    if isinstance(runs_on, dict):
+        labels = runs_on.get("labels")
+        if isinstance(labels, str):
+            return [labels]
+        return [str(x) for x in (labels or [])]
+    return [str(x) for x in (runs_on or [])]
+
+
+def _environment_name(job: dict) -> str | None:
+    """A job's deployment-environment name, in either spelling.
+
+    `environment: staging` and `environment: {name: staging, url: ...}` are both
+    valid and mean the same thing.
+    """
+    environment = (job or {}).get("environment")
+    if isinstance(environment, dict):
+        name = environment.get("name")
+        return None if name is None else str(name)
+    return None if environment is None else str(environment)
+
+
+def _docker_host_values(doc: dict) -> list[tuple[str, str]]:
+    """Every DOCKER_HOST value in the workflow, with where it was found.
+
+    Keyed on the exact name `DOCKER_HOST`, so sibling variables that merely
+    start with `DOCKER_` -- notably the job-level `DOCKER_CONFIG` that isolates
+    this job's registry credential and buildx state -- are not collected here
+    and cannot trip the DOCKER_HOST assertions.
+    """
+    found: list[tuple[str, str]] = []
+    for key, value in (doc.get("env") or {}).items():
+        if key == "DOCKER_HOST":
+            found.append(("workflow-level env", str(value)))
+    for job_name, job in (doc.get("jobs") or {}).items():
+        for key, value in (((job or {}).get("env")) or {}).items():
+            if key == "DOCKER_HOST":
+                found.append((f"job {job_name!r} env", str(value)))
+        for step in (job or {}).get("steps") or []:
+            for key, value in (((step or {}).get("env")) or {}).items():
+                if key == "DOCKER_HOST":
+                    found.append((f"step {(step or {}).get('name')!r} env", str(value)))
+    return found
+
+
 def _docker_exec_is_interactive(line: str) -> bool:
     """True when the `docker exec` on this line passes an -i style flag.
 
@@ -363,6 +418,49 @@ def check_deploy_workflow() -> None:
         "`bootstrap` must default to `false` -- an empty paperclip-home or a "
         "missing volume must be rejected unless a deploy explicitly opts in",
     )
+    # The plan's three non-negotiables, none of which was gated before: a
+    # mutation test proved `runs-on: ubuntu-latest` + `environment: Staging` +
+    # a hardcoded `DOCKER_HOST: ssh://root@10.0.0.9:22` all passed together.
+    # The first two fail loudly at runtime; the hardcoded host is the SILENT
+    # one -- it would render every application secret and deploy them to
+    # whatever machine that literal names.
+    for job_name, job in (doc.get("jobs") or {}).items():
+        labels = _runs_on_labels(job)
+        check(
+            "self-hosted" in labels,
+            f"job {job_name!r} must request the `self-hosted` runner label "
+            f"(got runs-on {labels!r}) -- the staging host is internal and "
+            "unreachable from a GitHub-hosted runner, so `ubuntu-latest` "
+            "fails at the first `ssh-keyscan` after the secrets have already "
+            "been rendered",
+        )
+        env_name = _environment_name(job)
+        check(
+            env_name == "staging",
+            f"job {job_name!r} must set `environment: staging`, exactly and in "
+            f"lowercase (got {env_name!r}) -- GitHub matches environment names "
+            "CASE-SENSITIVELY, so `Staging` resolves no secrets at all and "
+            "every one of them arrives as the empty string",
+        )
+
+    docker_hosts = _docker_host_values(doc)
+    check(
+        bool(docker_hosts),
+        "no DOCKER_HOST is set anywhere -- the deploy would run every "
+        "docker/compose call against the runner's own daemon",
+    )
+    for where, value in docker_hosts:
+        check(
+            "secrets.HOST" in value and "secrets.USERNAME" in value,
+            f"the DOCKER_HOST on {where} is {value!r}, which does not "
+            "reference both `secrets.HOST` and `secrets.USERNAME`. Every "
+            "DOCKER_HOST must be built from those secrets so a literal host "
+            "cannot be substituted: a hardcoded value is the one failure in "
+            "this file that is SILENT -- it renders every application secret "
+            "and deploys them to whatever machine that literal names, with "
+            "the smoke tests passing against it",
+        )
+
     script_lines = _run_script_lines(doc)
 
     traced = [ln.strip() for ln in script_lines if _enables_tracing(ln)]
@@ -425,7 +523,11 @@ def check_deploy_workflow() -> None:
                 stripped = ln.strip()
                 m = re.match(r"^(if|elif)\b(.*)$", stripped)
                 if m:
-                    gated = "bootstrap" in stripped.lower() or "BOOTSTRAP" in stripped
+                    # Case-insensitive: all three repos now read the input
+                    # through an `env: BOOTSTRAP:` binding and test
+                    # `[ "$BOOTSTRAP" = "true" ]`, rather than splicing
+                    # `${{ inputs.bootstrap }}` into the shell text.
+                    gated = "bootstrap" in stripped.lower()
                     if m.group(1) == "elif" and stack:
                         stack[-1] = gated
                     else:
@@ -615,6 +717,67 @@ def check_deploy_workflow() -> None:
         "this host with `ssh-keygen -R`, then append (`>>`)",
     )
 
+    # The negative guard above is NEGATIVE ONLY, which makes it much weaker
+    # than it reads: deleting both `ssh-keygen -R` lines AND truncating the
+    # append leaves nothing for KEYSCAN_TRUNCATE_RE to match, so the file
+    # passes with no host-key handling at all. These four positive assertions
+    # are what actually require the non-destructive merge to exist, and they
+    # are scoped to the SSH-setup step by name rather than to the flattened
+    # cross-step line list, so a stray `>>` somewhere else cannot satisfy them.
+    ssh_step_name = "Write SSH key and scan the host key"
+    ssh_step = _step_by_name(doc, ssh_step_name)
+    check(
+        ssh_step is not None,
+        f"no step named {ssh_step_name!r} -- the deploy must scan the host key "
+        "into $RUNNER_TEMP and merge it into ~/.ssh/known_hosts before any "
+        "ssh/scp/DOCKER_HOST call",
+    )
+    if ssh_step is not None:
+        ssh_lines = _script_lines(ssh_step.get("run") or "")
+        check(
+            any("ssh-keyscan" in ln and "RUNNER_TEMP" in ln for ln in ssh_lines),
+            f"the {ssh_step_name!r} step must run `ssh-keyscan` into a file "
+            "under $RUNNER_TEMP -- the scan has to land in job-scoped scratch "
+            "space first so the merge into the shared ~/.ssh/known_hosts can "
+            "be non-destructive",
+        )
+        check(
+            any(
+                re.search(r"\btest\s+-s\b", ln) and "RUNNER_TEMP" in ln
+                for ln in ssh_lines
+            ),
+            f"the {ssh_step_name!r} step must `test -s` the scanned file under "
+            "$RUNNER_TEMP -- `ssh-keyscan` exits 0 even when nothing answered, "
+            "so without this the run continues with an EMPTY known_hosts and "
+            "fails much later, after the build, on a confusing host-key error",
+        )
+        keygen_removals = [
+            ln for ln in ssh_lines if re.search(r"\bssh-keygen\s+-R\b", ln)
+        ]
+        bracketed = [ln for ln in keygen_removals if "[" in ln]
+        bare = [ln for ln in keygen_removals if "[" not in ln]
+        check(
+            len(keygen_removals) >= 2 and bool(bracketed) and bool(bare),
+            f"the {ssh_step_name!r} step must call `ssh-keygen -R` TWICE, once "
+            "for the bare host and once for the `[host]:port` spelling (found "
+            f"{len(keygen_removals)}: {len(bare)} bare, {len(bracketed)} "
+            "bracketed) -- `ssh-keyscan` writes a bare host for port 22 and "
+            "`[host]:port` otherwise, so removing only one spelling leaves a "
+            "stale key that makes StrictHostKeyChecking abort the deploy after "
+            "a host rebuild",
+        )
+        check(
+            any(
+                ">>" in ln and "known_hosts" in ln and "~/.ssh" in ln
+                for ln in ssh_lines
+            ),
+            f"the {ssh_step_name!r} step must APPEND (`>>`) the scanned key "
+            "onto ~/.ssh/known_hosts -- without the append the scan never "
+            "reaches the file ssh actually reads, and with `>` instead it "
+            "would truncate entries sibling jobs on this persistent runner "
+            "rely on",
+        )
+
     # The private key must never land in ~/.ssh -- this runner is shared
     # with sibling repos' deploys (trc-hermes-agent, trc-open-webui), which
     # can run concurrently on the same $HOME. A shared ~/.ssh/id_rsa would
@@ -654,6 +817,20 @@ def check_deploy_workflow() -> None:
         "runner is persistent, so every secret this workflow writes to disk "
         "must be removed even when an earlier step fails",
     )
+    if cleanup_step is not None:
+        # Killing the agent was ungated. Deleting $RUNNER_TEMP/id_rsa does not
+        # unload the key: a leaked ssh-agent keeps the DECRYPTED private key in
+        # memory on a persistent runner, reachable by anything that can guess
+        # or read the socket path, for as long as that agent lives -- and a new
+        # one is started on every dispatch.
+        check(
+            "ssh-agent -k" in "\n".join(_script_lines(cleanup_step.get("run") or "")),
+            "the `if: always()` cleanup step must run `ssh-agent -k` -- "
+            "removing the key FILE does not unload the key, and a leaked agent "
+            "holds the decrypted private key in memory on this persistent "
+            "runner until the machine reboots, with one more leaked per "
+            "dispatch",
+        )
 
     # Repo-specific: the paperclip-home guards must run on plain SSH, never
     # under DOCKER_HOST -- a DOCKER_HOST proxies the Docker API, not a shell,

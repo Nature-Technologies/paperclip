@@ -76,8 +76,9 @@ Three consequences of the remote-daemon design worth knowing:
 **The runner is persistent and SHARED.** Unlike a GitHub-hosted runner, this
 machine is reused by later jobs — including `trc-hermes-agent` and
 `trc-open-webui`'s deploys, which can run **concurrently** with this one on
-the same `$HOME`. That drove two different fixes, because the two shared
-files carry different risk:
+the same `$HOME`. **Three** files in that `$HOME` would otherwise be shared,
+and they carry different risk. Two are now isolated per job; only
+`known_hosts` remains genuinely shared:
 
 - **The private key is a hard collision, so it is structurally isolated.** It
   is written to `$RUNNER_TEMP/id_rsa` — **never** `~/.ssh/id_rsa` — and loaded
@@ -92,6 +93,24 @@ files carry different risk:
   the agent are both removed in the final `Clean up secrets on the runner`
   step, which runs with `if: always()` — including the path where an earlier
   step failed before the agent ever started.
+- **`~/.docker/config.json` is a hard collision too, and is likewise
+  structurally isolated.** The deploy job sets `DOCKER_CONFIG` as **job-level**
+  `env:`, pointing at a per-job directory outside the build context, and creates
+  it before `docker login`. Every `docker`, `docker compose`, `docker buildx`
+  and `docker/login-action` call in the job honours that variable, so the GHCR
+  credential and buildx's state both live in job-private scratch space. Without
+  it the final cleanup step's `docker logout ghcr.io` would strip the GHCR
+  credential out from under a sibling repo's concurrent `docker compose pull` —
+  which is exactly why the logout is safe to keep now: it can only touch this
+  job's own directory, which the cleanup then deletes outright.
+
+  Note that job-level here is correct and is **not** the hazard a job-level
+  `DOCKER_HOST` would be. `DOCKER_CONFIG` says only *where credentials live*,
+  never *which daemon to talk to*, so unlike `DOCKER_HOST` it cannot redirect
+  the build step off the runner. (It is built from `github.workspace` rather
+  than the more obvious `runner.temp` because the `runner` context is not
+  available in `jobs.<job_id>.env` — GitHub rejects the whole workflow with
+  "Unrecognized named-value: 'runner'".)
 - **`~/.ssh/known_hosts` is still genuinely shared, and that is left as a
   documented operational requirement rather than fixed structurally** — the
   risk is lower (worst case under a race is a redundant rescan, not a hard
@@ -109,6 +128,40 @@ files carry different risk:
 - `.env.staging` is likewise removed in the final cleanup step.
 
 ## Host prerequisites
+
+### One-time host preparation (before the FIRST dispatch)
+
+`bootstrap: true` cannot stand up a host on its own from nothing, and the list
+below is what the workflow genuinely cannot do for itself. Run this **once per
+host, as root or with sudo, before any dispatch** — including a `bootstrap:
+true` one:
+
+```
+sudo install -d -o <deploy-user> -g <deploy-user> /srv/trc /srv/trc/staging
+```
+
+Both levels are needed, not just the leaf: the deploy's host-prep step runs
+`mkdir -p` under `/srv/trc/staging`, which needs write on that directory, and
+creating `/srv/trc/staging` itself needs write on `/srv` — neither of which a
+non-root deploy user has on a fresh host. The deploy never uses `sudo`, by
+design, so this cannot be folded into the workflow.
+
+**`bootstrap: true` needs one more thing in this repo specifically.** Its
+`paperclip-home` creation path runs `chown 1000:1000` over SSH, and `chown` to
+another UID requires **root** — a plain deploy user cannot do it. So
+`bootstrap: true` can only create `paperclip-home` if **either**:
+
+- the deploy user **is itself UID 1000** (then `mkdir` + `chown 1000:1000` is a
+  no-op chown to its own uid, which is permitted), **or**
+- that one `chown` is covered by passwordless sudo for the deploy user.
+
+If neither holds, `paperclip-home` must be **pre-created by hand**, and then
+`bootstrap: true` will find it already correct and skip the creation path
+(the existence and `stat -Lc '%u'` guards still run, unconditionally):
+
+```
+sudo install -d -o 1000 -g 1000 /srv/trc/staging/paperclip-home
+```
 
 The deploy creates **only** `poc-net`, idempotently, on every run. Outside
 `bootstrap` mode (see below) it creates neither `trc-staging-paperclip-db` nor
@@ -171,20 +224,30 @@ runner **must run as a separate OS user**, so they do not share `$HOME` and
 therefore do not share `~/.ssh/known_hosts`. The private key itself does not
 have this constraint: it lives under the job-scoped `$RUNNER_TEMP`, so two
 jobs on the same runner user cannot collide over it even if this requirement
-is violated — only `known_hosts` is at risk.
+is violated. Neither does `~/.docker/config.json`, which the job-level
+`DOCKER_CONFIG` moves into a per-job directory. **`known_hosts` is the only
+genuinely shared file left**, which is why this requirement is about that file
+specifically.
 
 ### Phase 2 preconditions
 
 **Paperclip starts fresh.** Unlike hermes-agent and open-webui, it needs no
 data migrated, so Phase 2 for this repo is only:
 
+0. The one-time `sudo install -d … /srv/trc /srv/trc/staging` from "One-time
+   host preparation" above. This one is **never** optional — nothing in the
+   workflow can create it.
 1. `docker volume create trc-staging-paperclip-db` — empty is correct here.
-2. `mkdir -p /srv/trc/staging/paperclip-home && chown 1000:1000
-   /srv/trc/staging/paperclip-home` — empty is correct here too.
+2. `sudo install -d -o 1000 -g 1000 /srv/trc/staging/paperclip-home` — empty is
+   correct here too.
 3. Dispatch the deploy **once** with `bootstrap: true`.
 
-(Steps 1 and 2 can also be skipped entirely: dispatching straight away with
-`bootstrap: true` makes the workflow create both, empty, itself.)
+Step 1 **is** skippable — `bootstrap: true` creates the volume itself, over the
+Docker API, needing no host privileges. Step 2 is skippable **only if the
+deploy user is UID 1000 or has passwordless sudo for that `chown`**; see
+"One-time host preparation" above for why. With an ordinary non-1000 deploy
+user, `bootstrap: true` fails on the `chown` and step 2 must be run by hand.
+Step 0 is never skippable under any configuration.
 
 ## Running a deploy
 
@@ -397,6 +460,27 @@ top-level network no service joins is silently ignored and an extra one added
 to a service would quietly put it on the backend bridge. For the deploy
 workflow specifically it also asserts:
 
+- the job requests the **`self-hosted`** runner label (all three `runs-on`
+  spellings understood: scalar, list, and the `{group, labels}` mapping) —
+  `ubuntu-latest` cannot reach the internal staging host at all;
+- `environment` is exactly **`staging`**, lowercase — GitHub matches
+  environment names case-sensitively, so `Staging` resolves no secrets and
+  every one of them arrives as the empty string;
+- **every** `DOCKER_HOST` value references both `secrets.HOST` and
+  `secrets.USERNAME`, so a literal host cannot be substituted. Of the three
+  assertions above this is the one that catches a **silent** failure: a
+  hardcoded `ssh://root@10.0.0.9:22` renders every application secret and
+  deploys them to whatever machine that literal names, with the smoke tests
+  passing against it. The other two fail loudly at runtime;
+- the `Write SSH key and scan the host key` step **positively** contains the
+  whole non-destructive `known_hosts` merge: an `ssh-keyscan` into
+  `$RUNNER_TEMP`, a `test -s` on it, `ssh-keygen -R` **twice** (the bare-host
+  and `[host]:port` spellings), and an append (`>>`) onto
+  `~/.ssh/known_hosts`. The "never truncate" rule below is negative-only, and
+  on its own it passes a workflow that has no host-key handling at all;
+- the `if: always()` cleanup step runs `ssh-agent -k` — deleting the key file
+  does not unload the key, and a leaked agent keeps it decrypted in memory on
+  this persistent runner, one more per dispatch;
 - `docker context create` appears **nowhere** in the workflow;
 - `DOCKER_HOST` appears only as **step-level** `env:`, never at workflow or
   job level — either would apply to the build step too;
@@ -418,7 +502,8 @@ workflow specifically it also asserts:
 - the private key is never written to `~/.ssh/id_rsa` anywhere in the
   workflow — only under `$RUNNER_TEMP`;
 - an `if: always()` cleanup step exists that removes `id_rsa` and
-  `.env.staging` and runs `docker logout`;
+  `.env.staging` and runs `docker logout` (which is now confined to this job's
+  own `DOCKER_CONFIG` directory, and cannot strip a sibling job's credential);
 - `docker volume create` and any `mkdir` of the paperclip-home bind-mount
   source (by literal path, `$PAPERCLIP_HOME_DIR`, or `${PAPERCLIP_HOME_DIR}`)
   are each only reachable from inside a branch whose **enclosing** `if`/`elif`

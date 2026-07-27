@@ -51,15 +51,24 @@ run-name: Deploy paperclip to Dev/Test Server
 #     path must be absolute and must already exist on the server
 #   - this runner is PERSISTENT and SHARED with sibling repos' deploys
 #     (trc-hermes-agent, trc-open-webui), which can run concurrently on the
-#     same $HOME. The private key is loaded into a per-job ssh-agent from a
-#     file under $RUNNER_TEMP -- never ~/.ssh/id_rsa -- so one job's cleanup
-#     can never delete the key a sibling job is mid-deploy with. Every
-#     secret this workflow writes to disk (the key, .env.staging) is removed
-#     and the agent killed in the final cleanup step, which runs even when
-#     an earlier step fails. ~/.ssh/known_hosts is still genuinely shared
-#     (see docs/deploy/trc-staging.md) -- that is lower-risk (worst case is
-#     a redundant rescan) and is handled by documenting a one-job-at-a-time
-#     / separate-users requirement instead of structural isolation
+#     same $HOME. THREE files in that $HOME would otherwise be shared; two
+#     of them are isolated structurally here:
+#       * the private key -- loaded into a per-job ssh-agent from a file
+#         under $RUNNER_TEMP, never ~/.ssh/id_rsa, so one job's cleanup can
+#         never delete the key a sibling job is mid-deploy with
+#       * ~/.docker/config.json -- the job-level DOCKER_CONFIG below points
+#         every docker/compose/buildx call at a per-job directory instead.
+#         Without it, this job's cleanup `docker logout ghcr.io` would strip
+#         the GHCR credential out from under a sibling repo's concurrent
+#         `docker compose pull`, and buildx state would be shared too
+#       * ~/.ssh/known_hosts -- still genuinely shared (see
+#         docs/deploy/trc-staging.md). Left shared deliberately: the merge
+#         below is non-destructive so the worst case is a redundant rescan,
+#         and it is handled by documenting a one-job-at-a-time /
+#         separate-users requirement rather than structurally
+#     Every secret this workflow writes to disk (the key, .env.staging, the
+#     per-job docker config) is removed and the agent killed in the final
+#     cleanup step, which runs even when an earlier step fails.
 #   - the deploy pulls the IMMUTABLE `:git-<7-char-sha>` tag this run built,
 #     not the moving `:staging` pointer -- see the "Render the environment
 #     file" step
@@ -99,9 +108,36 @@ jobs:
     runs-on: [self-hosted, linux]
     environment: staging
     timeout-minutes: 60
+    # Per-job Docker config directory, so nothing this job does to the GHCR
+    # credential can reach a sibling repo's concurrent deploy on the same
+    # $HOME -- and vice versa. docker, docker compose, docker buildx and
+    # docker/login-action all honour DOCKER_CONFIG, so this one variable
+    # isolates both the credential store and buildx's own state.
+    #
+    # Job level is correct and is NOT the hazard a job-level DOCKER_HOST
+    # would be: DOCKER_CONFIG only says WHERE credentials live, never WHICH
+    # daemon to talk to, so it cannot redirect the build step off the runner.
+    #
+    # The path is built from `github.workspace` rather than the more obvious
+    # `runner.temp`, because the `runner` context is NOT available in
+    # `jobs.<job_id>.env` -- GitHub rejects the whole workflow with
+    # "Unrecognized named-value: 'runner'". `github.workspace` is available
+    # there, and its PARENT is used on purpose: the directory must stay
+    # OUTSIDE the `context: .` build context, or buildx would upload the GHCR
+    # credential into the image build.
+    env:
+      DOCKER_CONFIG: ${{ github.workspace }}/../.trc-docker-config-${{ github.run_id }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      - name: Create the per-job Docker config directory
+        run: |
+          set -eu
+          # Must exist before `docker login` writes into it. 700 because it is
+          # about to hold a registry credential.
+          install -m 700 -d "$DOCKER_CONFIG"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG"
 
       - name: Write SSH key and scan the host key
         env:
@@ -295,8 +331,22 @@ jobs:
       - name: Verify host preconditions
         env:
           DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
         run: |
           set -eu
+          # A workflow_dispatch boolean renders as exactly `true` or `false`.
+          # Read through an env: binding and validated here rather than
+          # spliced as `${{ inputs.bootstrap }}` straight into the shell text
+          # below: the same form is used in every step of all three repos'
+          # deploys, so there is one place to reason about and no expression
+          # interpolation inside a test.
+          case "$BOOTSTRAP" in
+            true|false) ;;
+            *)
+              echo "::error::bootstrap must be true or false, got '$BOOTSTRAP'"
+              exit 1 ;;
+          esac
+
           # Proves the SSH transport and the remote daemon before anything else.
           docker version --format 'remote daemon {{.Server.Version}}'
 
@@ -308,7 +358,7 @@ jobs:
           # below still passing.
           if docker volume inspect trc-staging-paperclip-db >/dev/null 2>&1; then
             :
-          elif [ "${{ inputs.bootstrap }}" = "true" ]; then
+          elif [ "$BOOTSTRAP" = "true" ]; then
             echo "::warning::bootstrap=true -- creating trc-staging-paperclip-db. It will be EMPTY. Only intended for standing up a fresh host."
             docker volume create trc-staging-paperclip-db
           else
@@ -525,4 +575,10 @@ jobs:
           set -eu
           rm -f "$RUNNER_TEMP/id_rsa" .env.staging
           ssh-agent -k >/dev/null 2>&1 || true
+          # Both of these now act ONLY on this job's own DOCKER_CONFIG
+          # directory, never on the shared ~/.docker/config.json -- which is
+          # exactly why the logout is safe to keep: before DOCKER_CONFIG was
+          # isolated, this line stripped the GHCR credential out from under a
+          # sibling repo's concurrent `docker compose pull`.
           docker logout ghcr.io || true
+          rm -rf "$DOCKER_CONFIG"

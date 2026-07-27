@@ -5,7 +5,10 @@ name: TRC deploy checks
 
 on:
   push:
-    branches: [chore/new-ci]
+    # `dev` is listed so this gate keeps running once chore/new-ci merges --
+    # with only the feature branch here it would stop firing at exactly the
+    # point the assets become the deployed ones.
+    branches: [dev, chore/new-ci]
     paths:
       - 'deploy/trc/**'
       - '.github/workflows/trc-*.yml'

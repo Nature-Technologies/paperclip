@@ -41,6 +41,13 @@ EXPECTED_NETWORKS = {"poc-net"}
 EXPECTED_VOLUMES = {"trc-staging-paperclip-db"}
 EXPECTED_CONTAINERS = {"paperclip", "paperclip-postgres"}
 NO_PORTS_SERVICES = {"postgres"}
+# Service-level membership, which is a different assertion from EXPECTED_NETWORKS
+# above. A top-level network that no service joins is silently IGNORED, and the
+# converse matters just as much here: adding `trc-shared` to either service's own
+# `networks:` list would put Paperclip or Postgres on the backend bridge, which
+# this project deliberately stays off, and neither `docker compose config` nor
+# `up` would object.
+EXPECTED_SERVICE_NETWORKS = {"paperclip": {"poc-net"}, "postgres": {"poc-net"}}
 
 failures: list[str] = []
 
@@ -76,6 +83,19 @@ def env_example_keys() -> list[str]:
         for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
         if "=" in line and not line.lstrip().startswith("#")
     ]
+
+
+def service_networks(spec: dict) -> set[str]:
+    """The networks a service joins, in either the list or the mapping form.
+
+    `networks: [poc-net]` and `networks: {poc-net: {aliases: [...]}}` are both
+    valid compose and mean the same membership, so both spellings have to be
+    read or a reformat could quietly turn the assertion off.
+    """
+    nets = (spec or {}).get("networks")
+    if nets is None:
+        return set()
+    return set(nets)
 
 
 def check_env_example_declares_every_reference() -> None:
@@ -252,17 +272,58 @@ def check_deploy_workflow() -> None:
         "host keys must be pinned via TRC_SSH_KNOWN_HOSTS, not bypassed",
     )
 
+    # Both the literal path and the variable spellings: `mkdir -p
+    # "$PAPERCLIP_HOME_DIR"` creates exactly the same directory as `mkdir -p
+    # /srv/trc/staging/paperclip-home`, so matching only the literal would let
+    # the ban be reintroduced by name.
     created = [
         ln.strip()
         for ln in script_lines
-        if re.search(r"\bmkdir\b[^\n]*paperclip-home", ln)
+        if re.search(
+            r"\bmkdir\b[^\n]*(paperclip-home|\$\{?PAPERCLIP_HOME_DIR\}?)", ln
+        )
     ]
     check(
         not created,
         f"the deploy must NOT create the /paperclip bind mount, but {created} "
-        "does. An empty directory lets Paperclip bootstrap a fresh unclaimed "
-        "instance over data that should have been migrated, and that directory "
-        "holds secrets/master.key and the only copy of the hermes_gateway wiring",
+        "does. That directory holds secrets/master.key and the only copy of the "
+        "hermes_gateway wiring, so a typo'd path must fail loudly instead of "
+        "being created empty -- which is also why `allow_bootstrap` relaxes only "
+        "the instance-state check and never this one. Creating it here would let "
+        "a mistyped path be silently accepted as a fresh install",
+    )
+
+    volume_creates = [
+        ln.strip()
+        for ln in script_lines
+        if re.search(r"\bdocker\s+volume\s+create\b", ln)
+    ]
+    check(
+        not volume_creates,
+        f"{volume_creates} pre-creates a volume on the host. Compose REFUSES to "
+        "start when an external volume is missing, and that fail-closed "
+        "behaviour is the entire point of declaring the volume external: "
+        "creating it here converts a loud failure into a silently EMPTY volume "
+        "and the run goes green -- Postgres initialises a brand-new database, "
+        "Paperclip comes up with no data, and every smoke test still passes. "
+        "The volume is created during the Phase 2 migration, never by a deploy. "
+        "`docker network create poc-net` is fine and stays: a network carries "
+        "no data",
+    )
+
+    unguarded_flock = [
+        ln.strip()
+        for ln in script_lines
+        if "flock" in ln and "-c" in ln and not re.search(r"-c\s*'set -e\b", ln)
+    ]
+    check(
+        not unguarded_flock,
+        f"{unguarded_flock} runs a `flock -c` script whose first statement is "
+        "not `set -e`. The -c string is a SEPARATE shell, so the enclosing "
+        "`set -eu` does not reach into it: without it a failed `docker compose "
+        "pull` is ignored and `up -d` silently redeploys the image already on "
+        "the host while the run reports success. The style this asserts is "
+        "`flock <lock> -c 'set -e` with the commands on the following lines",
     )
 
 
@@ -322,12 +383,31 @@ def main() -> int:
         f"got {sorted(n for n in container_names if n)}",
     )
 
+    check(
+        set(services) == set(EXPECTED_SERVICE_NETWORKS),
+        f"services must be exactly {sorted(EXPECTED_SERVICE_NETWORKS)}, got "
+        f"{sorted(services)} -- every service needs an entry in "
+        "EXPECTED_SERVICE_NETWORKS or its network membership goes unasserted",
+    )
+
     for svc, spec in services.items():
         check(
             spec.get("restart") == "unless-stopped",
             f"service {svc!r} must set `restart: unless-stopped` -- there is no "
             "cross-project depends_on, so restart is the only ordering mechanism",
         )
+        expected_svc_nets = EXPECTED_SERVICE_NETWORKS.get(svc)
+        if expected_svc_nets is not None:
+            check(
+                service_networks(spec) == expected_svc_nets,
+                f"service {svc!r} must join exactly "
+                f"{sorted(expected_svc_nets)}, got "
+                f"{sorted(service_networks(spec))} -- a top-level network no "
+                "service joins is silently ignored, and an extra one added here "
+                "would put this service on the backend bridge it deliberately "
+                "stays off; neither `docker compose config` nor `up` objects to "
+                "either mistake",
+            )
         for dep in spec.get("depends_on") or {}:
             check(
                 dep in services,

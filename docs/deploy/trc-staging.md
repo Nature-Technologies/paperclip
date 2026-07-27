@@ -11,8 +11,11 @@ Bringing Paperclip up is deferrable: it is not required to unblock chat.
 ## Running a deploy
 
 1. Find the digest:
-   `docker buildx imagetools inspect ghcr.io/nature-technologies/paperclip:<tag> --format '{{.Manifest.Digest}}'`
-   (the package is `paperclip`, not `trc-paperclip`)
+   `docker buildx imagetools inspect ghcr.io/nature-technologies/trc-paperclip:<tag> --format '{{.Manifest.Digest}}'`
+   (the repository was renamed from `paperclip` to `trc-paperclip`; its
+   publish workflow derives the GHCR package from `github.repository`, so
+   current builds land under `trc-paperclip` — the old `paperclip` package is
+   frozen history)
 2. Actions → **TRC staging deploy (paperclip)** → Run workflow → paste the
    `sha256:...` digest.
 

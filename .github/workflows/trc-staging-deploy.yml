@@ -27,7 +27,7 @@ concurrency:
 jobs:
   deploy:
     name: Deploy paperclip to staging
-    if: github.repository == 'Nature-Technologies/paperclip'
+    if: github.repository == 'Nature-Technologies/trc-paperclip'
     runs-on: ubuntu-latest
     environment: staging
     timeout-minutes: 20
@@ -118,7 +118,7 @@ jobs:
 
           umask 077
           {
-            printf 'PAPERCLIP_IMAGE=ghcr.io/nature-technologies/paperclip@%s\n' "$DIGEST"
+            printf 'PAPERCLIP_IMAGE=ghcr.io/nature-technologies/trc-paperclip@%s\n' "$DIGEST"
             printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
             printf 'BETTER_AUTH_SECRET=%s\n' "$BETTER_AUTH_SECRET"
             printf 'PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=%s\n' "$SIGNING_SECRET"

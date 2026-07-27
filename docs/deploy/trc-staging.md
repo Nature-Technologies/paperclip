@@ -50,6 +50,12 @@ The bind mount at `/paperclip` holds `instances/default/`: `workspaces/`,
   through and the container runs as `node`, so without `chown -R 1000:1000` the
   first write to `/paperclip` fails with `EACCES` and the container crash-loops.
   The workflow checks the owner and refuses to deploy otherwise.
+- **It must not be merely present and empty.** A directory that exists and is
+  correctly owned but holds no instance state would defeat the point of the
+  first guard just as effectively as a missing directory: Paperclip would
+  still bootstrap a fresh *unclaimed* instance. The workflow also refuses to
+  deploy unless at least one of `instances/default/config.json` or
+  `secrets/master.key` is present.
 
 `config.json` also carries the `hermes_gateway` adapter's URL and API key —
 there is no `HERMES_*` environment variable in the compose file, and that is

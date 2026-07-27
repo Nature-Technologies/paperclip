@@ -152,10 +152,29 @@ jobs:
             echo "Provision it during the Phase 2 migration -- do not let this deploy create it."
             exit 1
           fi
-          owner="$(stat -c '%u' /srv/trc/staging/paperclip-home)"
+          # -L is required: [ -d ] above and Docker's bind mount both follow
+          # symlinks, so ownership must be read from the target, not the
+          # link, or a symlink could pass this guard while the directory it
+          # actually resolves to is wrong.
+          owner="$(stat -Lc '%u' /srv/trc/staging/paperclip-home)"
           if [ "$owner" != "1000" ]; then
             echo "/srv/trc/staging/paperclip-home is owned by UID $owner, expected 1000."
             echo "Bind mounts carry host ownership straight through and the container runs as node=1000, so the first write to /paperclip would fail with EACCES and the container would crash-loop."
+            exit 1
+          fi
+
+          # An empty-but-present directory would satisfy both guards above
+          # and still let Paperclip bootstrap a fresh UNCLAIMED instance over
+          # data that should have been migrated -- the exact failure the
+          # directory-existence guard exists to prevent. Require at least one
+          # sign of real instance state. `&&` (not `||`) is deliberate: this
+          # must fail only when BOTH are missing, so a legitimately partial
+          # state is not blocked.
+          if [ ! -f /srv/trc/staging/paperclip-home/instances/default/config.json ] \
+             && [ ! -f /srv/trc/staging/paperclip-home/secrets/master.key ]; then
+            echo "/srv/trc/staging/paperclip-home exists but holds no instance state:"
+            echo "neither instances/default/config.json nor secrets/master.key is present."
+            echo "Deploying against it would let Paperclip bootstrap a fresh UNCLAIMED instance over data that should have been migrated. Provision this directory during the Phase 2 migration."
             exit 1
           fi
 

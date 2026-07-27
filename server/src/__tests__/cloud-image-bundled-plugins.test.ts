@@ -19,7 +19,17 @@ import { BUNDLED_PLUGIN_CATALOG } from "../services/bundled-plugins.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const dockerfile = readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
-const workflow = readFileSync(path.join(repoRoot, ".github", "workflows", "docker.yml"), "utf8");
+// This fork retired the upstream publish workflow by renaming it to
+// `.disabled` (GitHub only reads `.yml`/`.yaml` under `.github/workflows`, so
+// the rename fully deactivates it). The file CONTENT is unchanged -- the rename
+// is R100 -- so the three-way drift guard below still tests exactly what it
+// always tested. This read is at MODULE level, so pointing it at the old name
+// throws ENOENT at import time and takes the whole test FILE down, not just one
+// case.
+const workflow = readFileSync(
+  path.join(repoRoot, ".github", "workflows", "docker.yml.disabled"),
+  "utf8",
+);
 
 function parseList(source: string, pattern: RegExp, label: string): string[] {
   const match = source.match(pattern);

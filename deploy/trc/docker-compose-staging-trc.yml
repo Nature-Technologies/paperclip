@@ -1,0 +1,88 @@
+# TRC staging deploy for paperclip. Additive and TRC-only -- no upstream
+# tooling reads this file, and it is deliberately outside docker/ so upstream
+# merges cannot conflict with the compose files there.
+# See docs/deploy/trc-staging.md.
+#
+# This project carries BOTH paperclip and its postgres. Postgres is private to
+# paperclip, so it belongs here rather than in a shared project.
+name: trc-staging-paperclip
+
+networks:
+  # Only poc-net. paperclip and postgres deliberately stay OFF trc-shared --
+  # only hermes-agent and open-webui reach the trc-backend stack.
+  poc-net:
+    external: true
+
+volumes:
+  # The Postgres database. Named -db rather than -data to end the collision in
+  # the retired stack, where `paperclip-data` meant both this volume and the
+  # host directory bind-mounted at /paperclip.
+  trc-staging-paperclip-db:
+    external: true
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: paperclip-postgres
+    networks: [poc-net]
+    restart: unless-stopped
+    # No `ports:` at all, on purpose: 5432 is reachable only from other
+    # containers on poc-net, never from the host. The validator asserts this.
+    environment:
+      POSTGRES_USER: paperclip
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+      POSTGRES_DB: paperclip
+    volumes:
+      - trc-staging-paperclip-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paperclip"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  paperclip:
+    image: ${PAPERCLIP_IMAGE:?PAPERCLIP_IMAGE must be set}
+    container_name: paperclip
+    networks: [poc-net]
+    restart: unless-stopped
+    depends_on:
+      # Preserved: postgres is in THIS compose project, so unlike the
+      # cross-project links the split had to drop, this ordering still works.
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${PAPERCLIP_BIND:-0.0.0.0}:3100:3100"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3100"
+      PAPERCLIP_HOME: "/paperclip"
+      DATABASE_URL: "postgres://paperclip:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/paperclip"
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated"
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "private"
+      # Baked into auth callbacks and shown to the first admin, who opens it
+      # and chooses "Claim this instance". Must be the real external URL a
+      # browser can reach -- a localhost value is wrong on a server.
+      #
+      # These three now use `:?`. In the retired stack they deliberately did
+      # not, because compose interpolated the whole file before filtering by
+      # profile, so a `:?` here could block the chat stack from starting. In
+      # its own project paperclip can fail fast the way it should.
+      PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:?PAPERCLIP_PUBLIC_URL must be set}"
+      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+      PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "${PAPERCLIP_TOOL_ACTION_SIGNING_SECRET:?PAPERCLIP_TOOL_ACTION_SIGNING_SECRET must be set}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}"
+      # NOTE: no HERMES_* variable here, and that is not an omission. The
+      # hermes_gateway adapter's URL and API key live in
+      # $PAPERCLIP_HOME_DIR/instances/default/config.json, which is read-only
+      # after the instance is claimed. That file is therefore the only copy of
+      # the Paperclip -> Hermes wiring and a third copy of HERMES_API_KEY. The
+      # deploy workflow fingerprint-checks it against hermes-agent's copy; it
+      # cannot set it.
+    volumes:
+      # An absolute host path, NOT a repo-relative one. In the retired stack
+      # this was ./paperclip-data, relative to that repo's directory -- which
+      # is exactly why retiring the repo would have taken the path with it.
+      # Holds instances/default/: workspaces/, data/run-logs/, data/backups/,
+      # logs/, config.json and secrets/master.key. It is a bind mount, so
+      # `down -v` never touches it.
+      - ${PAPERCLIP_HOME_DIR:?PAPERCLIP_HOME_DIR must be set}:/paperclip

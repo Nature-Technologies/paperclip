@@ -6,12 +6,23 @@ import test from "node:test";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
+// This fork retired the release machinery by renaming it to `.disabled`
+// (GitHub only reads `.yml`/`.yaml` under `.github/workflows`, so the rename
+// fully deactivates a workflow while keeping it reviewable and reversible).
+// The FILE CONTENT is unchanged -- both renames are R100 -- so these
+// assertions still test exactly what they always tested; only the names moved.
+// They are pointed at the retired names rather than deleted because `pr.yml`
+// (which IS active) invokes this test file, and because the day the fork picks
+// the release workflows back up, the wiring they assert must still hold.
+const RELEASE_WORKFLOW = "release.yml.disabled";
+const RELEASE_VERIFY_WORKFLOW = "release-verify.yml.disabled";
+
 function readWorkflow(name) {
   return readFileSync(path.join(repoRoot, ".github/workflows", name), "utf8");
 }
 
 test("release workflow delegates stable and canary verification to the reusable workflow", () => {
-  const releaseWorkflow = readWorkflow("release.yml");
+  const releaseWorkflow = readWorkflow(RELEASE_WORKFLOW);
 
   assert.match(
     releaseWorkflow,
@@ -25,7 +36,7 @@ test("release workflow delegates stable and canary verification to the reusable 
 });
 
 test("release verify workflow covers the same split test surface as stable PR verification", () => {
-  const verifyWorkflow = readWorkflow("release-verify.yml");
+  const verifyWorkflow = readWorkflow(RELEASE_VERIFY_WORKFLOW);
 
   assert.match(verifyWorkflow, /workflow_call:/);
   assert.match(verifyWorkflow, /node \.\/scripts\/release-package-map\.mjs check/);

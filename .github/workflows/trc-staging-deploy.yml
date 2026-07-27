@@ -105,7 +105,7 @@ jobs:
     # Labelled, not bare `self-hosted`, so a non-Linux runner registered
     # later on this label set cannot pick up a job that needs docker/buildx
     # and an OpenSSH client.
-    runs-on: [self-hosted, linux]
+    runs-on: self-hosted
     environment: staging
     timeout-minutes: 60
     # Per-job Docker config directory, so nothing this job does to the GHCR

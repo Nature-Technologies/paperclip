@@ -683,3 +683,23 @@ jobs:
           # Untagged leftovers only. Without -a this cannot touch a :git-<sha>.
           docker image prune -f >/dev/null 2>&1 || true
           echo "retention done"
+
+      - name: Cap the runner's build cache
+        # No DOCKER_HOST: this bounds the RUNNER's daemon. The layer cache moved
+        # here from the deploy host, and leaving it unbounded would relocate the
+        # disk problem rather than fix it.
+        #
+        # 30GB is a starting value, not a measured one. Retune it once a
+        # dispatch shows how large the cache actually gets.
+        continue-on-error: true
+        env:
+          SHA_TAG: ${{ steps.tags.outputs.sha }}
+          STAGING_TAG: ${{ steps.tags.outputs.staging }}
+        run: |
+          set -eu
+          docker builder prune --keep-storage=30GB --force
+          # The image itself is not the cache -- it has already been shipped and
+          # the build cache above is what keeps the next build warm -- so the
+          # runner's copy can go, keeping its image store flat.
+          docker image rm "$SHA_TAG" "$STAGING_TAG" >/dev/null 2>&1 || true
+          echo "runner cache capped"

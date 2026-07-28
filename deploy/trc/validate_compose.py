@@ -80,6 +80,7 @@ REMOTE_HOST_ENV_KEYS = ("DOCKER_HOST", "REMOTE_DOCKER_HOST")
 # here is the entire point of this arrangement.
 LOCAL_DAEMON_STEPS = {
     "Build the image on the runner",
+    "Cap the runner's build cache",
     "Set up Buildx",
     "Verify the runner can build",
 }
@@ -1257,6 +1258,29 @@ def check_deploy_workflow() -> None:
             and smoke_index < retention_index,
             "retention must run after the smoke test -- removing images before "
             "the deploy is proven would take the rollback target with them",
+        )
+
+    # The layer cache moved from the deploy host to the runner, and an unbounded
+    # cache there just relocates the disk problem this change exists to fix.
+    cache_cap_name = "Cap the runner's build cache"
+    cache_cap_step = _step_by_name(doc, cache_cap_name)
+    check(
+        cache_cap_step is not None,
+        f"no step named {cache_cap_name!r} -- the build cache lives on the "
+        "runner now, and leaving it unbounded moves the disk problem instead of "
+        "solving it",
+    )
+    if cache_cap_step is not None:
+        check(
+            cache_cap_step.get("continue-on-error") is True,
+            f"the {cache_cap_name!r} step must set `continue-on-error: true` -- "
+            "it runs after a successful deploy and must not mark it red",
+        )
+        cache_lines = _script_lines(cache_cap_step.get("run") or "")
+        check(
+            any("builder prune" in ln for ln in cache_lines),
+            f"the {cache_cap_name!r} step must run `docker builder prune` with "
+            "a size cap -- that is the cache this change relocated to the runner",
         )
 
 

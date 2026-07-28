@@ -87,6 +87,7 @@ LOCAL_DAEMON_STEPS = {
 REMOTE_DAEMON_STEPS = {
     "Confirm the image landed on the host",
     "Deploy",
+    "Prune old images on the host",
     "Smoke test",
     "Verify host preconditions",
 }
@@ -1218,6 +1219,44 @@ def check_deploy_workflow() -> None:
             "the runner preflight must run before the lockfile refresh -- a "
             "runner that cannot build should cost seconds, not a full pnpm "
             "install first",
+        )
+
+    # Retention, not pruning. :git-<sha> tags live only in the deploy host's
+    # image store and are the only rollback targets that exist, so `docker image
+    # prune -a` there destroys every one of them. Keep-N bounds the disk without
+    # that cliff. Checked against comment-stripped lines, so the warnings about
+    # this command in the surrounding comments do not trip it.
+    check(
+        not any(
+            re.search(r"image\s+prune\b.*(\s-\w*a|\s--all)", ln)
+            for ln in script_lines
+        ),
+        "`docker image prune -a` must appear nowhere -- :git-<sha> tags are "
+        "HOST-LOCAL and are the only rollback targets that exist, so it "
+        "destroys all of them. Remove images by explicit keep-N instead",
+    )
+    retention_name = "Prune old images on the host"
+    retention_step = _step_by_name(doc, retention_name)
+    check(
+        retention_step is not None,
+        f"no step named {retention_name!r} -- the host accumulates a :git-<sha> "
+        "image per deploy and nothing else removes them, which is one of the "
+        "two things that filled its disk under the old scheme",
+    )
+    if retention_step is not None:
+        check(
+            retention_step.get("continue-on-error") is True,
+            f"the {retention_name!r} step must set `continue-on-error: true` -- "
+            "it runs after a deploy that has already succeeded and a cleanup "
+            "problem must not mark that deploy red",
+        )
+        retention_index = _step_index(doc, retention_name)
+        smoke_index = _step_index(doc, "Smoke test")
+        check(
+            None not in (retention_index, smoke_index)
+            and smoke_index < retention_index,
+            "retention must run after the smoke test -- removing images before "
+            "the deploy is proven would take the rollback target with them",
         )
 
 

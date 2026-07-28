@@ -643,3 +643,43 @@ jobs:
             fi
           fi
           REMOTE
+
+      - name: Prune old images on the host
+        # Deliberately NOT `docker image prune -a`: :git-<sha> tags exist only
+        # in this host's image store and are the only rollback targets there
+        # are, so that command destroys every one of them. Keep the newest few
+        # and whatever is running; remove the rest.
+        #
+        # continue-on-error because the deploy has already succeeded and been
+        # smoke-tested by the time this runs. A cleanup problem is a warning,
+        # not a failed deploy.
+        continue-on-error: true
+        env:
+          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
+          KEEP: "5"
+        run: |
+          set -eu
+          # --no-trunc so the ID is the full sha256: form that `docker inspect`
+          # returns below; the truncated form would never compare equal and the
+          # running image would be a removal candidate on every deploy.
+          running="$(docker inspect --format '{{.Image}}' paperclip 2>/dev/null || true)"
+          echo "keeping the newest $KEEP :git-* images, plus the running one"
+          docker images --no-trunc \
+            --filter "reference=${IMAGE}:git-*" \
+            --format '{{.CreatedAt}}|{{.ID}}|{{.Repository}}:{{.Tag}}' \
+            | sort -r \
+            | tail -n +"$((KEEP + 1))" \
+            | while IFS='|' read -r _ id tag; do
+                if [ -n "$running" ] && [ "$id" = "$running" ]; then
+                  echo "keeping $tag (currently running)"
+                  continue
+                fi
+                if docker rmi "$tag" >/dev/null 2>&1; then
+                  echo "removed $tag"
+                else
+                  echo "::warning::could not remove $tag"
+                fi
+              done
+          # Untagged leftovers only. Without -a this cannot touch a :git-<sha>.
+          docker image prune -f >/dev/null 2>&1 || true
+          echo "retention done"

@@ -125,6 +125,16 @@ Three consequences of this design worth knowing:
   preconditions` reads `df` over SSH and fails under 10 GB, warns under 20 GB:
   the host no longer builds, but the incoming image load still needs room for
   the new image alongside the one running.
+- **RAM is guarded on the runner, and it is the tighter constraint.** The UI's
+  `vite build` runs *inside* the image build, and V8 sizes its default
+  old-space heap at roughly **half** of the memory it can see, capped near
+  4 GB. `docker build` sets no memory limit by default, so that is the runner's
+  own RAM: a 4 GB runner gives Node a ~1.7 GB ceiling, and the build aborts
+  with `Ineffective mark-compacts near heap limit` and **exit 134** several
+  minutes in, naming the heap but not the cause. `Verify the runner can build`
+  fails under **8 GB** — the point at which the default heap reaches the same
+  ~4 GB that `ubuntu-latest` builds this identical `production` target with in
+  `docker.yml`, with no heap flag — and warns under 12 GB.
 - **Both machines are bounded after a successful deploy.** `Prune old images on
   the host` keeps the newest 5 `:git-<sha>` images plus whatever is running;
   `Cap the runner's build cache` prunes the runner's build cache to 30 GB and
@@ -284,13 +294,22 @@ is violated. Neither does `~/.docker/config.json`, which nothing in the
 workflow touches any more. **`known_hosts` is the only genuinely shared file
 left**, which is why this requirement is about that file specifically.
 
-The runner also needs **its own local Docker daemon** and **its own free disk**:
-the build happens there now. `Verify the runner can build` proves the daemon
-exists — failing immediately, with the fallback named, if it does not — and
-fails under 15 GB free, warns under 30 GB. It runs before the lockfile refresh
-so a runner that cannot build costs seconds rather than a full `pnpm install`
-first. The staging host is still guarded, but only for room to receive the
-image: `Verify host preconditions` fails under 10 GB and warns under 20 GB.
+The runner also needs **its own local Docker daemon**, **its own free disk**,
+and — the constraint that actually bites — **at least 8 GB of RAM**: the build
+happens there now. `Verify the runner can build` proves the daemon exists
+(failing immediately, with the fallback named, if it does not), fails under
+15 GB free disk and warns under 30 GB, and fails under 8 GB RAM and warns under
+12 GB. It runs before the lockfile refresh so a runner that cannot build costs
+seconds rather than a full `pnpm install` first. The staging host is still
+guarded, but only for room to receive the image: `Verify host preconditions`
+fails under 10 GB and warns under 20 GB.
+
+> **A modest runner will not build this image.** The first dispatch under this
+> scheme died in `vite build` with exit 134 on a runner whose default V8 heap
+> was ~1.7 GB. Cores and disk were not the problem; memory was. If the runner
+> cannot be given 8 GB, the build needs a larger host — the shape of the deploy
+> survives that (build somewhere that is not the staging host, ship over SSH),
+> only the machine changes.
 
 > If the runner turns out to have no local daemon, the shape of the deploy
 > survives — build somewhere that is not the staging host, ship over SSH — but

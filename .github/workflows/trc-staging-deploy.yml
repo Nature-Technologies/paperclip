@@ -190,6 +190,37 @@ jobs:
             exit 1
           fi
           echo "cores: $(nproc)"
+          # RAM matters more than cores here, and it is the one thing that made
+          # the move off the deploy host fail the first time. The UI's
+          # `vite build` runs INSIDE the image build, and V8 sizes its default
+          # old-space heap at roughly HALF of the memory it can see (capped near
+          # 4 GB). `docker build` applies no memory limit by default, so what it
+          # sees is this machine's RAM: a 4 GB runner gives Node a ~1.7 GB
+          # ceiling, which this build exceeds and aborts on with
+          # "Ineffective mark-compacts near heap limit" and exit 134 -- four
+          # minutes into the image build, naming the heap but not the cause.
+          #
+          # 8 GB is the threshold because that is where the default heap reaches
+          # the same ~4 GB that ubuntu-latest builds this image with today (see
+          # docker.yml, which builds the identical `production` target with no
+          # heap flag). Read from /proc/meminfo rather than a node one-liner:
+          # this step runs before Setup Node.js, and the runner has no system
+          # Node on PATH.
+          mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null) || mem_kb=""
+          case "$mem_kb" in
+            ''|*[!0-9]*)
+              echo "::warning::Could not read total memory on the runner - check free -h there manually." ;;
+            *)
+              mem_gb=$((mem_kb / 1000000))
+              if [ "$mem_kb" -lt 8000000 ]; then
+                echo "::error::Only ${mem_gb} GB RAM on the runner. V8 sizes its default heap at about half of visible memory, so the UI's vite build gets roughly a $((mem_kb / 2000000)) GB ceiling and aborts with exit 134 part-way through the image build. Give this runner 8 GB or more, or build on a larger host."
+                exit 1
+              elif [ "$mem_kb" -lt 12000000 ]; then
+                echo "::warning::${mem_gb} GB RAM on the runner - enough for the UI build, but with little margin."
+              else
+                echo "OK - ${mem_gb} GB RAM on the runner."
+              fi ;;
+          esac
           # The build cache lives on this machine now, so this is where
           # cold-build headroom has to exist. BuildKit's out-of-space failures
           # name everything except the cause.

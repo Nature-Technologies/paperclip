@@ -1,21 +1,32 @@
 name: TRC staging deploy (paperclip)
 run-name: Deploy paperclip to Dev/Test Server
 
-# Additive and TRC-only. Builds AND deploys in one run -- trc-publish.yml is
-# gone, so the tag this deploy pulls always exists by the time it pulls it.
+# Additive and TRC-only. Builds AND deploys in one run.
+#
+# The BUILD RUNS ON THE DEPLOY HOST, via the job-level DOCKER_HOST below --
+# same arrangement as trc-hermes-agent's and trc-open-webui's deploys. buildx's
+# default container driver starts with an empty cache every dispatch, which
+# made every deploy a cold 15-45 min build; the host's daemon holds the only
+# layer cache that persists. Only the source context crosses the network,
+# never an image.
+#
+# There is no registry: `push: false` puts the image straight into the deploy
+# host's image store, which is the daemon `docker compose up -d` talks to. The
+# compose service sets `pull_policy: never` so a missing image fails closed
+# instead of reaching out to GHCR, where the retired publish-then-pull scheme
+# left tags that a rollback dispatch could otherwise silently start.
+#
+# ROLLBACK IS HOST-LOCAL. `:git-<7-char-sha>` tags exist only in that host's
+# image store -- a `docker image prune -a` or a host rebuild destroys every
+# rollback target. See docs/deploy/trc-staging.md before pruning there.
 #
 # Runs on a SELF-HOSTED runner: the staging host is internal and unreachable
-# from a GitHub-hosted runner. The image is built locally on the runner (no
-# DOCKER_HOST in that step's env), pushed to GHCR, and only THEN does
-# `docker compose` talk to the staging host's daemon, over
-# `DOCKER_HOST=ssh://...` set as env: on the individual steps that need it.
+# from a GitHub-hosted runner.
 #
-# Never `docker context create`/`use` here. A context is persistent state on
-# a self-hosted runner: `create` fails "already exists" on the second run,
-# `use` repoints the runner's DEFAULT daemon for every later job on this
-# machine, and buildx binds to whichever daemon is current -- so an active
-# context would silently build the image on the deploy host instead of the
-# runner. Step-scoped DOCKER_HOST cannot leak into the build step that way.
+# Never `docker context create`/`use` here: this runner is shared with sibling
+# repos (trc-hermes-agent, trc-open-webui) and `use` would repoint the DEFAULT
+# daemon for their jobs too, and would fail "already exists" on the second run
+# besides. The job-level DOCKER_HOST is scoped to this job and cannot leak.
 #
 # This repo carries two things neither trc-hermes-agent nor trc-open-webui
 # does:
@@ -29,49 +40,48 @@ run-name: Deploy paperclip to Dev/Test Server
 #     wiring, so outside `bootstrap: true` it is only ever verified, never
 #     created. Those guards stay on plain SSH -- a DOCKER_HOST proxies the
 #     Docker API, not a shell, so it cannot stat a path on the host
-#     filesystem -- and run right after the SSH key is loaded, before GHCR
-#     login and before the build even starts, so a typo'd path fails in
-#     seconds rather than after a full build. Never substitute a
+#     filesystem -- and run before the build even starts, so a typo'd path
+#     fails in seconds rather than after a full build. Never substitute a
 #     bind-mounted probe container for these checks either: Docker creates a
 #     missing bind source as root, which is exactly the failure the guard
 #     exists to prevent.
 #
-# The build needs a pnpm lockfile refresh first: the Docker build's deps
-# stage installs with a frozen lockfile, so a pnpm-lock.yaml that has
-# drifted from package.json fails the build rather than the app. It is also
-# pinned to the `production` target explicitly -- the Dockerfile declares a
-# later `cloud` stage, and omitting `target:` would silently publish that
-# stage instead.
+# The build needs a pnpm lockfile refresh first: the Docker build's deps stage
+# installs with a frozen lockfile, so a pnpm-lock.yaml that has drifted from
+# package.json fails the build rather than the app. That refresh still happens
+# on the RUNNER -- the build context is assembled here and uploaded to the
+# host's daemon, so the lockfile it sees is the one this step leaves behind.
+# The build is also pinned to the `production` target explicitly -- the
+# Dockerfile declares a later `cloud` stage, and omitting `target:` would
+# silently deploy that stage instead.
 #
-# Consequences worth knowing:
-#   - the rendered .env.staging is read by the LOCAL compose CLI and never
-#     lands on the server; values reach the containers as environment, not
-#     as a file on disk
-#   - bind-mount sources are resolved by the REMOTE daemon, so every bind
-#     path must be absolute and must already exist on the server
-#   - this runner is PERSISTENT and SHARED with sibling repos' deploys
-#     (trc-hermes-agent, trc-open-webui), which can run concurrently on the
-#     same $HOME. THREE files in that $HOME would otherwise be shared; two
-#     of them are isolated structurally here:
-#       * the private key -- loaded into a per-job ssh-agent from a file
-#         under $RUNNER_TEMP, never ~/.ssh/id_rsa, so one job's cleanup can
-#         never delete the key a sibling job is mid-deploy with
-#       * ~/.docker/config.json -- the job-level DOCKER_CONFIG below points
-#         every docker/compose/buildx call at a per-job directory instead.
-#         Without it, this job's cleanup `docker logout ghcr.io` would strip
-#         the GHCR credential out from under a sibling repo's concurrent
-#         `docker compose pull`, and buildx state would be shared too
-#       * ~/.ssh/known_hosts -- still genuinely shared (see
-#         docs/deploy/trc-staging.md). Left shared deliberately: the merge
-#         below is non-destructive so the worst case is a redundant rescan,
-#         and it is handled by documenting a one-job-at-a-time /
-#         separate-users requirement rather than structurally
-#     Every secret this workflow writes to disk (the key, .env.staging, the
-#     per-job docker config) is removed and the agent killed in the final
-#     cleanup step, which runs even when an earlier step fails.
-#   - the deploy pulls the IMMUTABLE `:git-<7-char-sha>` tag this run built,
-#     not the moving `:staging` pointer -- see the "Render the environment
-#     file" step
+# Other consequences worth knowing:
+#   - no env file is written anywhere. The Deploy step binds the secrets as its
+#     own `env:`, and Compose resolves the compose file's ${...} references from
+#     that process environment -- so no secret touches disk on the runner or the
+#     server, and nothing is dotenv-parsed, which means a `$`, backtick or `#`
+#     in a value is taken literally instead of interpolated or truncated. The
+#     charset guard the retired `.env.staging` rendering needed is gone with it;
+#     the `@ : / ? #` guard on POSTGRES_PASSWORD is not, being about
+#     DATABASE_URL rather than about parsing
+#   - there is no `docker login` any more, so nothing here mutates the shared
+#     ~/.docker/config.json, and the per-job DOCKER_CONFIG that used to isolate
+#     it -- along with the `docker logout` that made it necessary -- is gone too
+#   - the /paperclip bind mount already exists on the host and is verified, not
+#     created, so nothing needs to be copied there for compose to start. Its
+#     source is resolved by the REMOTE daemon, so the path must be absolute
+#   - there is NO cleanup step, matching trc-hermes-agent and trc-open-webui.
+#     Nothing secret is written to disk any more except the private key, which
+#     lives only under $RUNNER_TEMP, which the runner clears at the start of
+#     each job, so it cannot collide with a sibling repo's concurrent deploy.
+#     The per-job ssh-agent, however, is left RUNNING: it holds the decrypted
+#     key in memory on this persistent runner until the machine reboots, one
+#     more agent per dispatch. Reap them with `pkill ssh-agent` on the runner
+#     if that accumulation matters
+#   - ~/.ssh/known_hosts is genuinely shared across sibling jobs on this
+#     runner. The merge below is non-destructive, so the worst case is a
+#     redundant rescan; see docs/deploy/trc-staging.md for the
+#     one-job-at-a-time / separate-users requirement that covers it
 
 on:
   workflow_dispatch:
@@ -86,15 +96,19 @@ on:
         type: boolean
         default: false
 
+# No `packages: write`: nothing is pushed to GHCR any more.
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: deploy-staging
   cancel-in-progress: false
 
 env:
+  # Still spelled as a GHCR reference even though nothing is pushed there: it
+  # is now only a local tag name in the deploy host's image store, and keeping
+  # the spelling means run logs and rollback tags read the same as they did
+  # under the retired publish-then-pull scheme.
   IMAGE: ghcr.io/nature-technologies/trc-paperclip
   COMPOSE_FILE_PATH: deploy/trc/docker-compose-staging-trc.yml
 
@@ -102,42 +116,18 @@ jobs:
   deploy:
     name: Build and deploy paperclip to staging
     if: github.repository == 'Nature-Technologies/trc-paperclip'
-    # Labelled, not bare `self-hosted`, so a non-Linux runner registered
-    # later on this label set cannot pick up a job that needs docker/buildx
-    # and an OpenSSH client.
-    runs-on: [self-hosted, linux]
+    runs-on: self-hosted
     environment: staging
     timeout-minutes: 60
-    # Per-job Docker config directory, so nothing this job does to the GHCR
-    # credential can reach a sibling repo's concurrent deploy on the same
-    # $HOME -- and vice versa. docker, docker compose, docker buildx and
-    # docker/login-action all honour DOCKER_CONFIG, so this one variable
-    # isolates both the credential store and buildx's own state.
-    #
-    # Job level is correct and is NOT the hazard a job-level DOCKER_HOST
-    # would be: DOCKER_CONFIG only says WHERE credentials live, never WHICH
-    # daemon to talk to, so it cannot redirect the build step off the runner.
-    #
-    # The path is built from `github.workspace` rather than the more obvious
-    # `runner.temp`, because the `runner` context is NOT available in
-    # `jobs.<job_id>.env` -- GitHub rejects the whole workflow with
-    # "Unrecognized named-value: 'runner'". `github.workspace` is available
-    # there, and its PARENT is used on purpose: the directory must stay
-    # OUTSIDE the `context: .` build context, or buildx would upload the GHCR
-    # credential into the image build.
     env:
-      DOCKER_CONFIG: ${{ github.workspace }}/../.trc-docker-config-${{ github.run_id }}
+      # Job-wide ON PURPOSE: the BUILD runs on the deploy server, not just the
+      # deploy. Every docker command below therefore talks to that daemon over
+      # SSH -- which is why the SSH key step must come first, before anything
+      # that shells out to docker.
+      DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
-
-      - name: Create the per-job Docker config directory
-        run: |
-          set -eu
-          # Must exist before `docker login` writes into it. 700 because it is
-          # about to hold a registry credential.
-          install -m 700 -d "$DOCKER_CONFIG"
-          echo "DOCKER_CONFIG=$DOCKER_CONFIG"
 
       - name: Write SSH key and scan the host key
         env:
@@ -153,18 +143,17 @@ jobs:
           if [ -z "$HOST" ]; then
             echo "::error::HOST is empty"; exit 1
           fi
-
-          # The key lives ONLY under $RUNNER_TEMP -- never ~/.ssh/id_rsa --
-          # and is loaded into a per-job ssh-agent. This runner is
-          # PERSISTENT and shared with sibling repos' deploys, which can run
-          # concurrently on the same $HOME: a shared ~/.ssh/id_rsa would let
-          # one job's cleanup delete the key a sibling job is mid-deploy
-          # with. The agent's socket is exported via $GITHUB_ENV so every
-          # later step in THIS job inherits it, which authenticates both the
-          # explicit ssh/scp calls below (passed -i explicitly too, since
-          # that costs nothing and does not depend on default-identity
-          # resolution) and the ssh the Docker CLI spawns internally for
-          # DOCKER_HOST.
+          # The key lives ONLY under $RUNNER_TEMP -- never ~/.ssh/id_rsa -- and
+          # is loaded into a per-job ssh-agent. This runner is PERSISTENT and
+          # shared with sibling repos' deploys, which can run concurrently on
+          # the same $HOME: a shared ~/.ssh/id_rsa would let one job's cleanup
+          # delete the key a sibling job is mid-deploy with. The agent's socket
+          # is exported via $GITHUB_ENV so every later step in THIS job inherits
+          # it, which authenticates both the explicit ssh/scp calls below
+          # (passed -i explicitly too, since that costs nothing and does not
+          # depend on default-identity resolution) and -- load-bearing here --
+          # the ssh the Docker CLI spawns internally for DOCKER_HOST, which
+          # every docker call in this job now goes through, including the build.
           install -m 600 -D /dev/null "$RUNNER_TEMP/id_rsa"
           printf '%s\n' "$SSH_PRIVATE_KEY_DEV" > "$RUNNER_TEMP/id_rsa"
           eval "$(ssh-agent -a "$RUNNER_TEMP/ssh-agent.sock")" >/dev/null
@@ -173,39 +162,28 @@ jobs:
             echo "SSH_AUTH_SOCK=$RUNNER_TEMP/ssh-agent.sock"
             echo "SSH_AGENT_PID=$SSH_AGENT_PID"
           } >> "$GITHUB_ENV"
-
-          # known_hosts is still genuinely SHARED across sibling jobs on
-          # this runner -- see docs/deploy/trc-staging.md, which documents
-          # that the runner must process one job at a time, and that
-          # multiple runners on one machine must run as separate users. The
-          # scan-then-append below is non-destructive, so the residual race
-          # here is low-risk (worst case: a redundant rescan), unlike the
-          # id_rsa collision above, which is a hard failure.
-          #
-          # Trust-on-first-use: the host key is taken from the host at
-          # deploy time rather than pinned. StrictHostKeyChecking stays ON,
-          # so a key that changes mid-run still aborts.
+          # Trust-on-first-use; StrictHostKeyChecking stays ON, so a key that
+          # changes mid-run still aborts. keyscan exits 0 even when nothing
+          # answered, so the `test -s` is the real reachability check -- and it
+          # must fail now, not 45 minutes into the build.
           ssh-keyscan -T 10 -p "$SSH_PORT" -H "$HOST" > "$RUNNER_TEMP/known_hosts"
-          # ssh-keyscan exits 0 even when nothing answered -- this is the
-          # actual reachability check, and it must fail now, not deep into
-          # the build.
           test -s "$RUNNER_TEMP/known_hosts"
           install -m 700 -d ~/.ssh
           touch ~/.ssh/known_hosts
-          # Remove any stale entry for this host, both spellings -- keyscan
-          # writes a bare host for port 22 and `[host]:port` otherwise -- then
-          # append the fresh scan. Never truncate with `>` or `tee`.
+          # Drop stale entries for both spellings (keyscan writes a bare host
+          # for port 22, `[host]:port` otherwise), then append. Never truncate
+          # with `>` or an unadorned `tee`: ~/.ssh/known_hosts persists between
+          # jobs on this runner, so the entries already there are not ours.
           ssh-keygen -R "$HOST" -f ~/.ssh/known_hosts >/dev/null 2>&1 || true
           ssh-keygen -R "[${HOST}]:${SSH_PORT}" -f ~/.ssh/known_hosts >/dev/null 2>&1 || true
           cat "$RUNNER_TEMP/known_hosts" >> ~/.ssh/known_hosts
 
       - name: Verify the paperclip-home guards
-        # These guards stay on plain SSH and run before anything else that
-        # touches the host or renders a secret -- before GHCR login, before
-        # the build, before "Verify host preconditions". A DOCKER_HOST
-        # proxies the Docker API, not a shell, so it has no way to stat a
-        # path on the host filesystem, and a wrong path or a wrong owner
-        # must fail the run in seconds rather than after a full build.
+        # Plain SSH, never the inherited DOCKER_HOST: a DOCKER_HOST proxies the
+        # Docker API, not a shell, so it has no way to stat a path on the host
+        # filesystem. Runs before the build for the same reason the host
+        # preconditions below do -- a wrong path or a wrong owner must fail the
+        # run in seconds rather than after a full build.
         env:
           HOST: ${{ secrets.HOST }}
           USERNAME: ${{ secrets.USERNAME }}
@@ -227,8 +205,8 @@ jobs:
             "BOOTSTRAP=$BOOTSTRAP bash -s" <<'REMOTE'
           set -eu
           # This literal must stay equal to the PAPERCLIP_HOME_DIR value the
-          # "Render the environment file" step below renders into
-          # .env.staging; it is the same bind-mount source.
+          # Deploy step below binds as its own `env:`; it is the same
+          # bind-mount source.
           DIR=/srv/trc/staging/paperclip-home
           if [ ! -d "$DIR" ]; then
             if [ "$BOOTSTRAP" = "true" ]; then
@@ -270,13 +248,6 @@ jobs:
           fi
           REMOTE
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Compute image tags
         id: tags
         run: |
@@ -284,78 +255,90 @@ jobs:
           printf 'staging=%s:staging\n' "$IMAGE" >> "$GITHUB_OUTPUT"
           printf 'sha=%s:git-%s\n' "$IMAGE" "${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
-          run_install: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 20
-
-      - name: Refresh lockfile for Docker build context
-        # The Docker build's deps stage installs with a frozen lockfile, so a
-        # pnpm-lock.yaml that has drifted from package.json fails the build
-        # rather than the app. Refreshing it here, in the workflow that feeds
-        # the Docker build context, is cheaper than requiring every commit
-        # that touches package.json to also hand-refresh the lockfile.
+      # Before the build, like the host preconditions below: a secret shaped
+      # like this cannot produce a working deploy, and finding that out after a
+      # cold build wastes the whole run.
+      - name: Verify the application secrets
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          PAPERCLIP_PUBLIC_URL: ${{ secrets.PAPERCLIP_PUBLIC_URL }}
         run: |
           set -eu
-          pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
+          # Kept from the retired `.env.staging` rendering; the generic
+          # `$`/backtick/`#` charset guard that sat next to it is not, because
+          # nothing dotenv-parses these values any more. This one is about
+          # DATABASE_URL, not about parsing: the compose file interpolates
+          # POSTGRES_PASSWORD into
+          # `postgres://paperclip:${POSTGRES_PASSWORD}@postgres:5432/paperclip`,
+          # where @ : / ? and # silently corrupt the connection string with no
+          # error from compose.
+          case "$POSTGRES_PASSWORD" in
+            ""|*[@:/?#]*)
+              echo "::error::POSTGRES_PASSWORD must be non-empty and must not contain @ : / ? or #. It is interpolated into DATABASE_URL, where those characters silently corrupt the connection string with no error from compose. Use: openssl rand -hex 32"
+              exit 1 ;;
+          esac
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4
+          # Baked into auth callbacks and shown to the first admin, who opens
+          # it and chooses "Claim this instance", so a localhost value is wrong
+          # on a server and produces an instance nobody outside the host can
+          # claim.
+          case "$PAPERCLIP_PUBLIC_URL" in
+            ""|*localhost*|*127.0.0.1*)
+              echo "::error::PAPERCLIP_PUBLIC_URL must be the external URL a browser can reach from outside the host. It is baked into auth callbacks and shown to the first admin, so a localhost value is wrong on a server."
+              exit 1 ;;
+          esac
+          echo "application secrets OK"
 
-      - name: Build and push
-        # NO DOCKER_HOST in this step's env -- it must build on the RUNNER,
-        # never on the deploy host. See the file header.
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          # Pin to the production stage explicitly: the Dockerfile declares a
-          # later `cloud` stage, and without a target the default would
-          # silently become that stage instead.
-          target: production
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ steps.tags.outputs.staging }}
-            ${{ steps.tags.outputs.sha }}
-          labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=min
-
+      # Runs BEFORE the build: the build happens on this host, so free disk and
+      # a reachable daemon are preconditions of the build itself. A full disk
+      # must fail in seconds, not 28 minutes in.
       - name: Verify host preconditions
         env:
-          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
           BOOTSTRAP: ${{ inputs.bootstrap }}
+          HOST: ${{ secrets.HOST }}
+          USERNAME: ${{ secrets.USERNAME }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
         run: |
           set -eu
           # A workflow_dispatch boolean renders as exactly `true` or `false`.
-          # Read through an env: binding and validated here rather than
-          # spliced as `${{ inputs.bootstrap }}` straight into the shell text
-          # below: the same form is used in every step of all three repos'
-          # deploys, so there is one place to reason about and no expression
-          # interpolation inside a test.
+          # Read through an env: binding and validated here rather than spliced
+          # as `${{ inputs.bootstrap }}` straight into the shell text below: the
+          # same form is used in every step of all three repos' deploys, so
+          # there is one place to reason about and no expression interpolation
+          # inside a test.
           case "$BOOTSTRAP" in
             true|false) ;;
             *)
               echo "::error::bootstrap must be true or false, got '$BOOTSTRAP'"
               exit 1 ;;
           esac
-
           # Proves the SSH transport and the remote daemon before anything else.
           docker version --format 'remote daemon {{.Server.Version}}'
-
+          # BuildKit's out-of-space failures name everything except the cause.
+          # Thresholds match trc-hermes-agent's and trc-open-webui's deploys.
+          avail=$(ssh -o BatchMode=yes -i "$RUNNER_TEMP/id_rsa" -p "$SSH_PORT" \
+            "${USERNAME}@${HOST}" \
+            'df --output=avail -B1 /var/lib/docker 2>/dev/null | tail -1') || avail=""
+          case "$avail" in
+            ''|*[!0-9]*)
+              echo "::warning::Could not read free space on the deploy host - check df -h manually." ;;
+            *)
+              gb=$((avail / 1000000000))
+              if [ "$avail" -lt 10000000000 ]; then
+                echo "::error::Only ${gb} GB free on the deploy host. A cold build needs more than that and fails obscurely when it runs out. See docs/deploy/trc-staging.md for what is safe to prune - note that pruning images also destroys rollback targets."
+                exit 1
+              elif [ "$avail" -lt 25000000000 ]; then
+                echo "::warning::${gb} GB free on the deploy host - enough for a cached build, tight for a cold one."
+              else
+                echo "OK - ${gb} GB free on the deploy host."
+              fi ;;
+          esac
           # Fail closed on the external volume, UNLESS bootstrapping a fresh
-          # host: Compose refuses to start when an external volume is
-          # missing, and that is the guard. Creating it on a routine deploy
-          # would boot Postgres against a silently EMPTY volume -- a brand
-          # new database, Paperclip with no data -- with every smoke test
-          # below still passing.
+          # host: Compose refuses to start when an external volume is missing,
+          # and that is the guard. Creating it on a routine deploy would boot
+          # Postgres against a silently EMPTY volume -- a brand new database,
+          # Paperclip with no data -- with every smoke test below still
+          # passing.
           if docker volume inspect trc-staging-paperclip-db >/dev/null 2>&1; then
             :
           elif [ "$BOOTSTRAP" = "true" ]; then
@@ -365,120 +348,135 @@ jobs:
             echo "::error::external volume trc-staging-paperclip-db does not exist on the host. This deploy will not create it silently -- create it by hand, or re-dispatch with bootstrap: true on a genuinely fresh host."
             exit 1
           fi
-
           # No trc-shared check here: paperclip and postgres are poc-net-only
-          # by design -- only hermes-agent and open-webui reach the
-          # trc-backend stack, so this project has nothing to verify on that
-          # bridge.
+          # by design -- only hermes-agent and open-webui reach the trc-backend
+          # stack, so this project has nothing to verify on that bridge.
           #
           # poc-net carries no data, so creating it is always safe and idempotent.
           docker network create poc-net 2>/dev/null || true
 
-      - name: Render the environment file
+      # Node BEFORE pnpm, and the order is load-bearing on this runner.
+      #
+      # `pnpm/action-setup` runs a self-installer that shells out to `node` by
+      # name. This self-hosted runner has NO system Node on PATH -- the only
+      # copy is the runner's own bundled one, which hosts the action's JS but
+      # is not on PATH for anything the action spawns. With pnpm first the
+      # installer therefore died in ~1s with a bare "self-installer exits with
+      # code 1" and no other output: the child never got far enough to report
+      # anything, which is why the message names nothing useful.
+      #
+      # `actions/setup-node` needs no pre-existing Node -- it installs one into
+      # $RUNNER_TOOL_CACHE and puts it on PATH -- so it is what makes the pnpm
+      # step possible, not the reverse.
+      #
+      # pr.yml has these two in the opposite order and passes, but only because
+      # ubuntu-latest ships Node preinstalled. Do not "align" this file to it.
+      #
+      # The usual reason to want pnpm first -- `cache: pnpm` on setup-node,
+      # which needs a pnpm binary to locate the store -- does not apply here:
+      # no cache is requested, so there is no chicken-and-egg to trade off.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - name: Refresh lockfile for Docker build context
+        # Runs on the RUNNER even though the build runs on the host: the build
+        # context is assembled here and uploaded, so the lockfile the deps
+        # stage installs from is the one this step leaves behind. The Docker
+        # build's deps stage installs with a frozen lockfile, so a
+        # pnpm-lock.yaml that has drifted from package.json fails the build
+        # rather than the app.
+        run: |
+          set -eu
+          pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          # The remote daemon's OWN builder, reached through the job-level
+          # DOCKER_HOST. The default container driver would start empty on
+          # every dispatch, which is the failure this whole arrangement exists
+          # to avoid.
+          driver: docker
+
+      - name: Build the image on the deploy server
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          # Pin to the production stage explicitly: the Dockerfile declares a
+          # later `cloud` stage, and without a target the default would
+          # silently become that stage instead.
+          target: production
+          # No registry: built straight into the deploy host's image store,
+          # which is the same daemon `docker compose up -d` talks to below.
+          push: false
+          tags: |
+            ${{ steps.tags.outputs.staging }}
+            ${{ steps.tags.outputs.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          # No `platforms`: build native to the server, or buildx silently
+          # switches on QEMU emulation. No cache-from/to: the daemon's own
+          # layer store is the cache now, and the docker driver cannot use the
+          # gha cache backend anyway. No attestations: they force a manifest
+          # list and an extra export pass for nothing.
+          provenance: false
+
+      - name: Deploy
+        # Compose resolves the compose file's ${...} references from THIS
+        # process environment. No env file is written, on the runner or the
+        # server, so no secret ever touches disk -- and because nothing is
+        # parsed as dotenv, values are taken literally: a `$`, backtick or `#`
+        # in a secret survives instead of being interpolated or truncated.
+        #
+        # Every variable the compose file references must be listed here, since
+        # there is no other source for them; deploy/trc/validate_compose.py
+        # asserts exactly that.
         env:
+          # The IMMUTABLE tag this run built, not the moving `:staging`
+          # pointer -- so the deploy runs exactly what this run built and "what
+          # is running" is unambiguous. To roll back, hardcode an older
+          # `:git-<7>` tag here on a throwaway branch, but only one still in
+          # the host's image store: these tags are HOST-LOCAL now and a
+          # `docker image prune -a` there destroys every rollback target. See
+          # docs/deploy/trc-staging.md.
+          PAPERCLIP_IMAGE: ${{ steps.tags.outputs.sha }}
+          PAPERCLIP_BIND: 0.0.0.0
+          PAPERCLIP_HOME_DIR: /srv/trc/staging/paperclip-home
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           BETTER_AUTH_SECRET: ${{ secrets.BETTER_AUTH_SECRET }}
-          SIGNING_SECRET: ${{ secrets.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET }}
+          PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: ${{ secrets.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           PAPERCLIP_PUBLIC_URL: ${{ secrets.PAPERCLIP_PUBLIC_URL }}
-          # The IMMUTABLE tag this run built, not the moving `:staging`
-          # pointer -- so the deploy runs exactly what this run built, and
-          # "what is running" is unambiguous. `:staging` is still pushed
-          # above (Build and push) as a human-readable pointer, but nothing
-          # in this workflow ever deploys it. For rollback, edit this one
-          # line on a throwaway branch to hardcode an older `:git-<7>` tag
-          # instead of this dynamic expression -- see
-          # docs/deploy/trc-staging.md.
-          DEPLOY_IMAGE: ${{ steps.tags.outputs.sha }}
         run: |
           set -eu
-          # This file stays on the runner. The local compose CLI reads it and
-          # sends the values to the remote daemon as container environment,
-          # so no plaintext secret is ever written to the staging host.
-
-          case "$PAPERCLIP_PUBLIC_URL" in
-            ""|*localhost*|*127.0.0.1*)
-              echo "::error::PAPERCLIP_PUBLIC_URL must be the external URL a browser can reach from outside the host. It is baked into auth callbacks and shown to the first admin, so a localhost value is wrong on a server."
-              exit 1 ;;
-          esac
-
-          # Stricter than the generic guard below, and kept as well as it:
-          # POSTGRES_PASSWORD is additionally interpolated into DATABASE_URL,
-          # where @ : / and ? corrupt the connection string too.
-          case "$POSTGRES_PASSWORD" in
-            ""|*[@:/?#]*)
-              echo "::error::POSTGRES_PASSWORD must be non-empty and must not contain @ : / ? or #. It is interpolated into DATABASE_URL, where those characters silently corrupt the connection string with no error from compose. Use: openssl rand -hex 32"
-              exit 1 ;;
-          esac
-
-          # Charset guard for every secret rendered into .env.staging below,
-          # extended to POSTGRES_PASSWORD too (it is compose-interpolated the
-          # same as any other value, on top of the stricter guard above).
-          # Compose's env_file parser interpolates $VAR and ${VAR} inside
-          # values and treats an unquoted ` #` as the start of a comment, so a
-          # secret containing $, a backtick or # reaches the container as a
-          # DIFFERENT string than the repository secret holds. Nothing errors:
-          # the service starts, and the damage shows up later as auth cookies
-          # that never validate, tool actions rejected as unsigned, or a
-          # DATABASE_URL Postgres itself never sees. Values are written
-          # unquoted on purpose, so rejecting the characters is the only
-          # reliable guard.
-          #
-          # PAPERCLIP_PUBLIC_URL is checked for these three characters ONLY: it
-          # legitimately contains : and /, so the stricter POSTGRES_PASSWORD
-          # pattern above must not be applied to it.
-          reject_interpolation_chars() {
-            case "$2" in
-              *'$'*|*'`'*|*'#'*)
-                echo "::error::$1 must not contain \$, a backtick or #. Compose's .env parser interpolates the first two and treats # as a comment, so the container would receive a different value than the secret holds."
-                exit 1 ;;
-            esac
-          }
-          reject_interpolation_chars POSTGRES_PASSWORD "$POSTGRES_PASSWORD"
-          reject_interpolation_chars BETTER_AUTH_SECRET "$BETTER_AUTH_SECRET"
-          reject_interpolation_chars PAPERCLIP_TOOL_ACTION_SIGNING_SECRET "$SIGNING_SECRET"
-          reject_interpolation_chars OPENROUTER_API_KEY "$OPENROUTER_API_KEY"
-          reject_interpolation_chars PAPERCLIP_PUBLIC_URL "$PAPERCLIP_PUBLIC_URL"
-
-          umask 077
-          {
-            printf 'PAPERCLIP_IMAGE=%s\n' "$DEPLOY_IMAGE"
-            printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
-            printf 'BETTER_AUTH_SECRET=%s\n' "$BETTER_AUTH_SECRET"
-            printf 'PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=%s\n' "$SIGNING_SECRET"
-            printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY"
-            printf 'PAPERCLIP_PUBLIC_URL=%s\n' "$PAPERCLIP_PUBLIC_URL"
-            printf 'PAPERCLIP_HOME_DIR=/srv/trc/staging/paperclip-home\n'
-            printf 'PAPERCLIP_BIND=0.0.0.0\n'
-          } > .env.staging
-
-      - name: Pull and deploy
-        env:
-          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
-        run: |
-          set -eu
-          # Read the tag back from .env.staging rather than recomputing it,
-          # so this log line can never drift from what actually gets
-          # deployed -- including on a rollback dispatch that hardcoded a
-          # different tag in the "Render the environment file" step.
-          echo "deploying $(grep '^PAPERCLIP_IMAGE=' .env.staging | cut -d= -f2-)"
-          docker compose --env-file .env.staging -f "$COMPOSE_FILE_PATH" pull
-          docker compose --env-file .env.staging -f "$COMPOSE_FILE_PATH" up -d --remove-orphans
-          # Record what actually landed, so a rollback has a named target. Read
-          # from the IMAGE, not the container: a container's inspect output has
-          # no RepoDigests key at all. Guarded: a digest record is best-effort
-          # and must never fail an otherwise-successful deploy.
+          echo "deploying $PAPERCLIP_IMAGE"
+          # No `pull`: the build above already put the image in THIS daemon's
+          # store, and the compose service sets `pull_policy: never` so a
+          # missing image fails closed instead of reaching for GHCR. Postgres
+          # keeps the default policy -- postgres:17-alpine is an upstream image
+          # this workflow never builds, so it must still be fetchable.
+          # No `--env-file`: see the note above.
+          docker compose -f "$COMPOSE_FILE_PATH" up -d --remove-orphans
+          # Best-effort record of what landed. There is no digest to print any
+          # more -- RepoDigests is only ever set for an image that went through
+          # a registry -- so the local image id is the record, and it must
+          # never fail an otherwise-successful deploy.
           if img="$(docker inspect --format '{{.Image}}' paperclip 2>/dev/null)"; then
-            echo "deployed digest:"
-            docker image inspect "$img" \
-              --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}(no digest){{end}}'
+            echo "deployed image id: $img"
           else
-            echo "could not inspect paperclip for a digest record (non-fatal)"
+            echo "could not inspect paperclip for a record (non-fatal)"
           fi
 
       - name: Smoke test
         env:
-          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           HOST: ${{ secrets.HOST }}
           USERNAME: ${{ secrets.USERNAME }}
@@ -490,7 +488,7 @@ jobs:
           # returns 0 against a password it has never seen. A credential
           # mismatch is precisely what has to be caught, because Postgres
           # IGNORES POSTGRES_PASSWORD on an already-initialised data directory
-          # -- so if this volume ever stops being a fresh one, the rendered
+          # -- so if this volume ever stops being a fresh one, the deployed
           # secret and the cluster's stored secret can silently diverge. Run a
           # real query.
           export PGPASSWORD="$POSTGRES_PASSWORD"
@@ -520,7 +518,7 @@ jobs:
           # Accept a 2xx or a redirect to sign-in.
           ok=0
           code=000
-          for i in $(seq 1 45); do
+          for _ in $(seq 1 45); do
             code="$(docker exec paperclip \
                       curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
                       http://127.0.0.1:3100/ 2>/dev/null || echo 000)"
@@ -563,22 +561,3 @@ jobs:
             fi
           fi
           REMOTE
-
-      - name: Clean up secrets on the runner
-        # if: always() -- this runner is PERSISTENT and reused by later jobs,
-        # so every secret written to disk above must be removed, and the
-        # per-job ssh-agent killed, even when an earlier step failed --
-        # including a failure before the agent ever started (ssh-agent -k
-        # and the rm's are all best-effort for exactly that reason).
-        if: always()
-        run: |
-          set -eu
-          rm -f "$RUNNER_TEMP/id_rsa" .env.staging
-          ssh-agent -k >/dev/null 2>&1 || true
-          # Both of these now act ONLY on this job's own DOCKER_CONFIG
-          # directory, never on the shared ~/.docker/config.json -- which is
-          # exactly why the logout is safe to keep: before DOCKER_CONFIG was
-          # isolated, this line stripped the GHCR credential out from under a
-          # sibling repo's concurrent `docker compose pull`.
-          docker logout ghcr.io || true
-          rm -rf "$DOCKER_CONFIG"

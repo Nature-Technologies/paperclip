@@ -11,106 +11,117 @@ deploy workflow.
 Bringing Paperclip up is deferrable: it is not required to unblock chat.
 
 **Build and deploy are one workflow, one dispatch.** There is no separate
-publish step any more — `trc-publish.yml` is gone. The workflow builds the
-image on the runner, pushes it to GHCR, and then rolls it out to the staging
-host in the same run, so the tag the deploy pulls always exists by the time it
-pulls it.
+publish step — `trc-publish.yml` is gone.
 
-The workflow runs on a **self-hosted runner** (`runs-on: [self-hosted,
-linux]` — labelled, not bare `self-hosted`, so a non-Linux runner registered
-later on this label set cannot pick up a job that needs docker/buildx and an
-OpenSSH client), because the staging host is internal and unreachable from a
-GitHub-hosted runner. The build step runs with no special Docker
-configuration — it builds and pushes using the runner's own local daemon.
-Only the three later steps that actually need to reach the staging host —
-`Verify host preconditions`, `Pull and deploy`, `Smoke test` — set
-`DOCKER_HOST: ssh://…` in their own **step-level** `env:`. That scoping is
-deliberate and never a workflow-level or job-level `env:`, and never a
-`docker context`:
+**The build runs ON the deploy host**, via a **job-level** `DOCKER_HOST`, the
+same arrangement `trc-hermes-agent` and `trc-open-webui` use. buildx's default
+`docker-container` driver starts with an **empty cache on every dispatch**,
+which made each deploy a cold 15–45 minute build; the host daemon's own layer
+store is the only cache that persists between runs. Only the source context
+crosses the network, never an image.
 
-- A `docker context` is *persistent state* on a self-hosted runner. `docker
-  context create` fails with "already exists" on the second run against the
-  same runner, and `docker context use` repoints that runner's **default**
-  daemon for every later job that lands on it — including unrelated jobs from
-  other workflows.
-- `docker buildx` binds to whichever daemon is *current*. An active context
-  (or a job-level `DOCKER_HOST`) would silently build the image **on the
-  deploy host** instead of the runner.
-- A step-level `env: DOCKER_HOST: …` cannot leak into the build step, because
-  it is set only on the steps that declare it.
+**There is no registry in the loop.** `push: false` puts the image straight
+into the deploy host's image store, which is the same daemon `docker compose
+up -d` talks to, so the tag the deploy runs always exists by the time it runs
+it — there is nothing to pull. The compose service sets `pull_policy: never`
+so a missing image **fails closed** instead of falling back to GHCR, where the
+retired publish-then-pull scheme left tags that a rollback dispatch could
+otherwise silently start. Nothing logs in to a registry, which is what makes
+the old per-job `DOCKER_CONFIG` (and the `docker logout` that required it)
+removable.
 
-The build additionally needs a **pnpm lockfile refresh** before it can run:
-the Docker build's `deps` stage installs with a frozen lockfile, so a
-`pnpm-lock.yaml` that has drifted from `package.json` fails the build rather
-than the app. `Setup pnpm` (`pnpm/action-setup@v6`, pinned to `9.15.4`,
+> **Rollback targets are host-local.** `:git-<7-char-sha>` tags exist only in
+> that host's image store. A `docker image prune -a` there, or a host rebuild,
+> destroys **every** rollback target. Read "Rolling back" below before pruning
+> on the staging host.
+
+The workflow runs on a **self-hosted runner** (`runs-on: self-hosted`) because
+the staging host is internal and unreachable from a GitHub-hosted runner.
+
+Because `DOCKER_HOST` is job-level, **every** `docker` call in the job — the
+build included — goes to the staging host over SSH. Two consequences follow
+directly:
+
+- **`Write SSH key and scan the host key` must be the first step after
+  checkout.** The `ssh` the Docker CLI spawns internally for `DOCKER_HOST` is
+  authenticated by the per-job `ssh-agent` that step starts, so any `docker`
+  call placed ahead of it fails host-key verification. The validator asserts
+  the ordering.
+- **Never a `docker context`.** A context is *persistent state* on a
+  self-hosted runner: `docker context create` fails "already exists" on the
+  second run, and `docker context use` repoints that runner's **default**
+  daemon for every later job on the machine, including `trc-hermes-agent`'s
+  and `trc-open-webui`'s. The job-level `DOCKER_HOST` is scoped to this job and
+  cannot leak. A **step-level** `DOCKER_HOST` is banned too now — it would
+  *override* the job-level one and silently point that single step at a
+  different daemon than the build and the deploy.
+
+The build still needs a **pnpm lockfile refresh** first, and that refresh still
+runs **on the runner**: the build context is assembled here and uploaded to the
+host's daemon, so the `pnpm-lock.yaml` the `deps` stage installs from is the
+one this step leaves behind. The Docker build installs with a frozen lockfile,
+so a lockfile that has drifted from `package.json` fails the build rather than
+the app. `Setup pnpm` (`pnpm/action-setup@v6`, pinned to `9.15.4`,
 `run_install: false`) and `Setup Node.js` (`actions/setup-node@v7`, node 20)
 run before `Refresh lockfile for Docker build context`
 (`pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile`), which
-in turn runs before `Set up Buildx`. The `Build and push` step itself pins
-`target: production` explicitly — the Dockerfile declares a later `cloud`
-stage, and omitting `target:` would silently publish that stage instead. This
-deploy only ever consumes the `production` target.
+in turn runs before `Set up Buildx`. `Set up Buildx` pins `driver: docker` —
+that is the whole performance argument, since it binds the build to the remote
+daemon's own persistent layer store. `Build the image on the deploy server`
+pins `target: production` explicitly — the Dockerfile declares a later `cloud`
+stage, and omitting `target:` would silently deploy that stage instead. It sets
+no `platforms` (build native to the server, or buildx switches on QEMU
+emulation), no `cache-from`/`cache-to` (the daemon's own layer store *is* the
+cache now, and the `docker` driver cannot use the gha backend anyway), and
+`provenance: false` (attestations force a manifest list and an extra export
+pass for nothing).
 
-Three consequences of the remote-daemon design worth knowing:
+Three consequences of this design worth knowing:
 
-- The rendered `.env.staging` file is read by the **local** Compose CLI via
-  `--env-file` and is never copied to the server. Its values reach the
-  containers as container environment, sent over the Docker API through the
-  SSH tunnel — there is no plaintext secret file on the staging host.
-- This project has **no config bind mount** to copy — unlike `trc-hermes-agent`'s
-  `config.yaml`, nothing needs to be `scp`'d onto the host for compose to
-  start. But `/srv/trc/staging/paperclip-home` **is** a pre-existing bind
-  mount this deploy does not manage the way it manages the Postgres volume: a
-  `DOCKER_HOST` proxies the Docker API, not a shell, so it cannot stat a path
-  on the host filesystem. The guards on that directory (see below) therefore
-  stay on plain SSH, in the `Verify the paperclip-home guards` step, and run
-  right after the SSH key is loaded — **before GHCR login and before the
-  build even starts**, so a typo'd path fails in seconds rather than after a
-  full build.
-- `docker compose pull` sends the **runner's** registry credentials to the
-  remote daemon (`X-Registry-Auth`), not the host's — the staging host never
-  **stores** a credential of its own. The workflow logs in to `ghcr.io` on the
-  runner with the built-in `GITHUB_TOKEN` before pulling; this works whether
-  the package is public (as it is today) or private.
+- **No env file is written anywhere.** The `Deploy` step binds every secret as
+  its own `env:`, and Compose resolves the compose file's `${…}` references
+  from that process environment. No secret touches disk on the runner *or* the
+  server, and nothing is dotenv-parsed — so a `$`, a backtick or a `#` inside a
+  secret is taken **literally** instead of being interpolated or truncated.
+  That is why the charset guard the retired `.env.staging` rendering needed is
+  gone; the `@ : / ? #` guard on `POSTGRES_PASSWORD` is not, being about
+  `DATABASE_URL` rather than about parsing.
+- **`/srv/trc/staging/paperclip-home` is a pre-existing bind mount** this
+  deploy verifies rather than manages. A `DOCKER_HOST` proxies the Docker API,
+  not a shell, so it cannot stat a path on the host filesystem; the guards on
+  that directory (see below) therefore reach the host over plain `ssh`, in the
+  `Verify the paperclip-home guards` step, which runs **before the build even
+  starts** so a typo'd path fails in seconds rather than after a full build.
+  Bind-mount sources are resolved by the **remote** daemon, so the path must be
+  absolute and must already exist on the server.
+- **Free disk on the host is now a precondition of the build itself**, not just
+  of the deploy. `Verify host preconditions` reads `df` over SSH and fails
+  under 10 GB, warns under 25 GB — BuildKit's out-of-space failures name
+  everything except the cause, and a full disk has to fail in seconds rather
+  than 28 minutes in.
 
 **The runner is persistent and SHARED.** Unlike a GitHub-hosted runner, this
 machine is reused by later jobs — including `trc-hermes-agent` and
 `trc-open-webui`'s deploys, which can run **concurrently** with this one on
-the same `$HOME`. **Three** files in that `$HOME` would otherwise be shared,
-and they carry different risk. Two are now isolated per job; only
-`known_hosts` remains genuinely shared:
+the same `$HOME`. Two of the three files that used to be shared there are gone
+as a category; only `known_hosts` is still genuinely shared:
 
-- **The private key is a hard collision, so it is structurally isolated.** It
-  is written to `$RUNNER_TEMP/id_rsa` — **never** `~/.ssh/id_rsa` — and loaded
-  into a per-job `ssh-agent` whose socket is exported via `$GITHUB_ENV` for
-  every later step in that job. A shared `~/.ssh/id_rsa` would let one job's
-  cleanup (`rm -f ~/.ssh/id_rsa`) delete the key a sibling job is mid-deploy
-  with; per-job `$RUNNER_TEMP` isolation makes that impossible, since
-  `$RUNNER_TEMP` is scoped to the individual job. The agent authenticates both
-  the explicit `ssh`/`scp` calls (which also pass `-i "$RUNNER_TEMP/id_rsa"`
-  explicitly, redundantly with the agent, since that costs nothing) and the
-  `ssh` the Docker CLI spawns internally for `DOCKER_HOST`. The key file and
-  the agent are both removed in the final `Clean up secrets on the runner`
-  step, which runs with `if: always()` — including the path where an earlier
-  step failed before the agent ever started.
-- **`~/.docker/config.json` is a hard collision too, and is likewise
-  structurally isolated.** The deploy job sets `DOCKER_CONFIG` as **job-level**
-  `env:`, pointing at a per-job directory outside the build context, and creates
-  it before `docker login`. Every `docker`, `docker compose`, `docker buildx`
-  and `docker/login-action` call in the job honours that variable, so the GHCR
-  credential and buildx's state both live in job-private scratch space. Without
-  it the final cleanup step's `docker logout ghcr.io` would strip the GHCR
-  credential out from under a sibling repo's concurrent `docker compose pull` —
-  which is exactly why the logout is safe to keep now: it can only touch this
-  job's own directory, which the cleanup then deletes outright.
-
-  Note that job-level here is correct and is **not** the hazard a job-level
-  `DOCKER_HOST` would be. `DOCKER_CONFIG` says only *where credentials live*,
-  never *which daemon to talk to*, so unlike `DOCKER_HOST` it cannot redirect
-  the build step off the runner. (It is built from `github.workspace` rather
-  than the more obvious `runner.temp` because the `runner` context is not
-  available in `jobs.<job_id>.env` — GitHub rejects the whole workflow with
-  "Unrecognized named-value: 'runner'".)
+- **The private key is structurally isolated.** It is written to
+  `$RUNNER_TEMP/id_rsa` — **never** `~/.ssh/id_rsa` — and loaded into a per-job
+  `ssh-agent` whose socket is exported via `$GITHUB_ENV` for every later step in
+  that job. A shared `~/.ssh/id_rsa` would let one job delete the key a sibling
+  job is mid-deploy with; `$RUNNER_TEMP` is scoped to the individual job and the
+  runner clears it at the start of each one, which makes that impossible. The
+  agent authenticates both the explicit `ssh` calls (which also pass
+  `-i "$RUNNER_TEMP/id_rsa"` explicitly, redundantly with the agent, since that
+  costs nothing) and — load-bearing under a job-level `DOCKER_HOST` — the `ssh`
+  the Docker CLI spawns internally for **every** `docker` call in the job,
+  including the build.
+- **`~/.docker/config.json` is no longer touched at all.** Nothing logs in to a
+  registry, so there is no credential to isolate, no `docker logout` that could
+  strip a sibling job's credential mid-deploy, and no per-job `DOCKER_CONFIG`
+  needed to contain either. The validator rejects a `docker login`,
+  `docker logout` or `docker/login-action` reappearing.
 - **`~/.ssh/known_hosts` is still genuinely shared, and that is left as a
   documented operational requirement rather than fixed structurally** — the
   risk is lower (worst case under a race is a redundant rescan, not a hard
@@ -125,7 +136,20 @@ and they carry different risk. Two are now isolated per job; only
   parallelize trc-hermes-agent, trc-open-webui and paperclip deploys), each
   runner must run as a **separate OS user** so they do not share `$HOME` and
   therefore do not share `~/.ssh/known_hosts`.
-- `.env.staging` is likewise removed in the final cleanup step.
+
+**There is no cleanup step any more**, matching `trc-hermes-agent` and
+`trc-open-webui` — and the two bullets above are what make its removal safe
+rather than an oversight. No env file is rendered and nothing logs in to a
+registry, so the private key is the only secret that still reaches the runner's
+disk, and it lives under `$RUNNER_TEMP`, which the runner clears itself. The
+validator pins that reasoning down: if any step ever names `id_rsa` outside
+`$RUNNER_TEMP`, or writes an env file, the check fails and the cleanup step has
+to come back with it.
+
+**The per-job `ssh-agent` is left running, though.** It holds the *decrypted*
+private key in memory on this persistent runner until the machine reboots — one
+more agent per dispatch. Reap them with `pkill ssh-agent` on the runner if that
+accumulation matters.
 
 ## Host prerequisites
 
@@ -184,10 +208,10 @@ The deploy creates **only** `poc-net`, idempotently, on every run. Outside
 `workflow_dispatch` takes a `bootstrap` boolean input, default `false`. It
 does **double duty**, gating two independent things at once:
 
-- In the `Verify host preconditions` step (`DOCKER_HOST`), when `true` it
+- In the `Verify host preconditions` step (over the Docker API), when `true` it
   **creates** `trc-staging-paperclip-db` instead of failing when it is
   missing, and logs an `::warning::`.
-- In the `Verify the paperclip-home guards` step (plain SSH), when `true` it
+- In the `Verify the paperclip-home guards` step (plain `ssh`), when `true` it
   **creates** `/srv/trc/staging/paperclip-home`, owned by UID 1000, if it is
   missing, and **permits an empty directory** to pass the instance-state
   check that otherwise rejects one. Both are logged loudly.
@@ -224,10 +248,13 @@ runner **must run as a separate OS user**, so they do not share `$HOME` and
 therefore do not share `~/.ssh/known_hosts`. The private key itself does not
 have this constraint: it lives under the job-scoped `$RUNNER_TEMP`, so two
 jobs on the same runner user cannot collide over it even if this requirement
-is violated. Neither does `~/.docker/config.json`, which the job-level
-`DOCKER_CONFIG` moves into a per-job directory. **`known_hosts` is the only
-genuinely shared file left**, which is why this requirement is about that file
-specifically.
+is violated. Neither does `~/.docker/config.json`, which nothing in the
+workflow touches any more. **`known_hosts` is the only genuinely shared file
+left**, which is why this requirement is about that file specifically.
+
+The runner also needs enough **free disk on the staging host**, not on itself:
+the build happens there now. `Verify host preconditions` fails under 10 GB and
+warns under 25 GB before the build starts.
 
 ### Phase 2 preconditions
 
@@ -251,51 +278,62 @@ Step 0 is never skippable under any configuration.
 
 ## Running a deploy
 
-The workflow builds and publishes two tags on every dispatch, but they play
-different roles:
+The workflow tags the image twice on every dispatch, **in the deploy host's
+local image store** — nothing is pushed anywhere. The two tags play different
+roles:
 
 - `ghcr.io/nature-technologies/trc-paperclip:staging` — a **moving** pointer,
-  overwritten by every run. Pushed for human convenience (e.g. browsing the
-  GHCR package), but **nothing in this workflow ever deploys it.**
+  overwritten by every run. Kept for human convenience when reading `docker
+  images` on the host, but **nothing in this workflow ever deploys it.**
 - `ghcr.io/nature-technologies/trc-paperclip:git-<7-char-sha>` — an
   **immutable** tag naming the exact commit that was built. **This is what
-  gets deployed.** The `Render the environment file` step sets
-  `DEPLOY_IMAGE: ${{ steps.tags.outputs.sha }}` in its own `env:` and writes
-  that value into `.env.staging` as `PAPERCLIP_IMAGE`, so the deploy runs
-  exactly what this run built — "what is running" is unambiguous, and never
-  depends on `:staging` having been overwritten by a later, unrelated run
-  between build and deploy.
+  gets deployed.** The `Deploy` step sets
+  `PAPERCLIP_IMAGE: ${{ steps.tags.outputs.sha }}` in its own `env:`, so the
+  deploy runs exactly what this run built — "what is running" is unambiguous,
+  and never depends on `:staging` having been overwritten by a later, unrelated
+  run between build and deploy.
+
+The `ghcr.io/…` spelling is kept even though nothing is pushed there: it is now
+only a local tag name, and keeping the spelling means run logs and rollback
+tags read the same as they did under the retired publish-then-pull scheme.
 
 1. Actions → **TRC staging deploy (paperclip)** → Run workflow.
 2. Leave `bootstrap` unchecked (default `false`) unless this is the first
    deploy to a brand-new host or a deliberate first deploy of a fresh
    instance (see "First-run bootstrap" below).
-3. The workflow builds the image from the checked-out ref (`target:
-   production`, after refreshing the pnpm lockfile), pushes both tags, and
-   deploys the `:git-<7-char-sha>` one it just pushed.
+3. The workflow builds the image **on the staging host** from the checked-out
+   ref (`target: production`, after refreshing the pnpm lockfile on the
+   runner), tags it twice there, and deploys the `:git-<7-char-sha>` one.
 
-The `Pull and deploy` step logs the deployed tag by reading it back out of
-`.env.staging` (`grep '^PAPERCLIP_IMAGE=' .env.staging`) rather than
-recomputing it, so the log line can never drift from what is actually
-running — including under the rollback override below.
+The `Deploy` step echoes `$PAPERCLIP_IMAGE` — the same variable Compose
+resolves — so the log line can never drift from what is actually running,
+including under the rollback override below. It then records the local image
+id. There is no digest to print any more: `RepoDigests` is only ever set for an
+image that went through a registry.
 
 ### Rolling back
 
-**There is no digest input any more.** Because every routine deploy already
-runs the immutable tag it just built, rolling back to an *older* build means
-re-dispatching the workflow from a branch where the **`Render the environment
-file`** step — not `Pull and deploy` — has its `DEPLOY_IMAGE` env line
-hardcoded to an older tag instead of the dynamic
+> **Read this first: rollback targets are HOST-LOCAL.** `:git-<7-char-sha>`
+> tags now live only in the staging host's image store. A `docker image prune
+> -a` there, or a host rebuild, destroys every one of them, and there is no
+> registry copy to fall back on — `pull_policy: never` makes that fail closed
+> rather than silently starting a stale GHCR image. Check `docker images` on
+> the host for the tag you intend to roll back to **before** you start.
+
+**There is no digest input.** Because every routine deploy already runs the
+immutable tag it just built, rolling back to an *older* build means
+re-dispatching the workflow from a branch where the **`Deploy`** step has its
+`PAPERCLIP_IMAGE` env line hardcoded to an older tag instead of the dynamic
 `${{ steps.tags.outputs.sha }}` expression:
 
 1. Branch off the current `dev` (name it anything that is not `dev`, e.g.
    `rollback/2026-07-27`).
 2. In `.github/workflows/trc-staging-deploy.yml` on that branch, find the
-   `Render the environment file` step and change its
-   `DEPLOY_IMAGE: ${{ steps.tags.outputs.sha }}` line to a hardcoded
-   `DEPLOY_IMAGE: ghcr.io/nature-technologies/trc-paperclip:git-<short-sha>`
-   — pick the short sha from a previous run's logs or the GHCR package's tag
-   list. Commit and push the branch.
+   `Deploy` step and change its `PAPERCLIP_IMAGE: ${{ steps.tags.outputs.sha }}`
+   line to a hardcoded
+   `PAPERCLIP_IMAGE: ghcr.io/nature-technologies/trc-paperclip:git-<short-sha>`
+   — pick the short sha from a previous run's logs, and confirm it is still in
+   the host's image store. Commit and push the branch.
 3. Actions → **TRC staging deploy (paperclip)** → Run workflow, and select
    **that branch** as the workflow ref (the "Use workflow from" selector). The
    deploy is `workflow_dispatch`-only, so it runs the workflow definition from
@@ -304,15 +342,17 @@ hardcoded to an older tag instead of the dynamic
    deploy from `dev` as normal, which builds fresh and deploys its own new
    `:git-<sha>`.
 
-Because build and deploy are unified, a rollback dispatch **still rebuilds and
-pushes fresh `:staging`/`:git-<newsha>` tags from that branch's source** — but
-with `DEPLOY_IMAGE` hardcoded as above, the deploy step itself pulls and runs
-the specific **older** tag you named, not the one it just built. A plain
-re-dispatch from an old branch, without that edit, is not itself a rollback —
-it would build and deploy a fresh image from old source under a new sha.
+Because build and deploy are unified, a rollback dispatch **still rebuilds
+fresh `:staging`/`:git-<newsha>` tags from that branch's source** — but with
+`PAPERCLIP_IMAGE` hardcoded as above, the deploy runs the specific **older**
+tag you named, not the one it just built. A plain re-dispatch from an old
+branch, without that edit, is not itself a rollback — it would build and deploy
+a fresh image from old source under a new sha.
 
-The `Pull and deploy` step still prints the digest that actually landed, so
-every run log records what is now running.
+If the tag you name is *not* in the host's store, `pull_policy: never` makes
+`compose up -d` fail with an image-not-found error rather than reaching for
+GHCR. That is the intended behaviour: the alternative is silently starting
+whatever the retired publish-then-pull scheme happened to leave under that tag.
 
 ## Required repository secrets (environment: `staging`)
 
@@ -323,9 +363,9 @@ not resolve here.
 | Secret | Notes |
 |---|---|
 | `SSH_PRIVATE_KEY_DEV` | Deploy user's private key |
-| `HOST` | Staging host, used both for `ssh-keyscan`, the paperclip-home guard's plain `ssh`, the fingerprint read, and every step's `DOCKER_HOST: ssh://${USERNAME}@${HOST}:${SSH_PORT}` |
+| `HOST` | Staging host, used for `ssh-keyscan`, the paperclip-home guard's plain `ssh`, the disk-space and fingerprint reads, and the job-level `DOCKER_HOST: ssh://${USERNAME}@${HOST}:${SSH_PORT}` that every `docker` call — the build included — goes through |
 | `USERNAME` | Deploy user on the host |
-| `SSH_PORT` | Optional, defaults to 22. Threaded through every consumer that needs it: the `ssh-keyscan` that seeds `known_hosts`, the paperclip-home guard's `ssh` call, every step's `DOCKER_HOST`, and the smoke test's fingerprint read over `ssh` — a mismatch between any of these would scan or dial a different endpoint than the others |
+| `SSH_PORT` | Optional, defaults to 22. Threaded through every consumer that needs it: the `ssh-keyscan` that seeds `known_hosts`, the paperclip-home guard's `ssh` call, the job-level `DOCKER_HOST`, and the disk-space and fingerprint reads over `ssh` — a mismatch between any of these would scan or dial a different endpoint than the others |
 | `POSTGRES_PASSWORD` | Also interpolated into `DATABASE_URL`. The workflow rejects an empty value or one containing `@ : / ? #`, since those characters silently corrupt the connection string with no error from compose |
 | `BETTER_AUTH_SECRET`, `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` | `openssl rand -hex 32` |
 | `OPENROUTER_API_KEY` | |
@@ -348,22 +388,33 @@ Trust-on-first-use has the same trade-off it always did:
   against. This is a deliberate trade against the operational cost of
   maintaining a pinned-key secret in step with any host-key rotation.
 
-Every secret rendered into `.env.staging` is charset-guarded: the workflow
-rejects any value containing `$`, a backtick or `#`. Compose's `env_file` parser
-interpolates the first two and treats `#` as a comment, so such a value would
-reach the container as a *different* string with nothing erroring — a mangled
-`BETTER_AUTH_SECRET` looks like auth cookies that never validate, a mangled
-`PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` looks like tool actions rejected as
-unsigned. `openssl rand -hex 32` never produces any of them. This guard
-applies to `POSTGRES_PASSWORD` too — Compose interpolates a `$` in that value
-exactly the same as any other, and it is additionally interpolated into
-`DATABASE_URL`, where `@ : / ?` also corrupt the connection string, so
-`POSTGRES_PASSWORD` carries **both** guards. `PAPERCLIP_PUBLIC_URL` is checked
-for `$`/backtick/`#` only — it legitimately contains `:` and `/`, so the
-stricter `POSTGRES_PASSWORD` pattern must not be applied to it. `.env.staging`
-itself is written on the runner and passed to Compose with `--env-file`; it
-is never copied to the host, and it is deleted by the final cleanup step even
-when an earlier step in the run fails.
+**The generic charset guard is gone, and its removal is a consequence of the
+no-env-file design rather than a relaxation.** The workflow used to reject any
+secret containing `$`, a backtick or `#`, because Compose's `env_file` parser
+interpolates the first two and treats `#` as a comment — so such a value
+reached the container as a *different* string with nothing erroring. Nothing
+dotenv-parses these values any more: the `Deploy` step binds them as its own
+`env:` and Compose reads them from the process environment, where they are
+taken literally. A `$` in a `BETTER_AUTH_SECRET` now survives verbatim.
+
+**Two guards do remain**, and both are about what the value *means* rather than
+how it is parsed. They run in `Verify the application secrets`, **before the
+build**, since neither can produce a working deploy and finding that out after
+a cold build wastes the whole run:
+
+- `POSTGRES_PASSWORD` must be non-empty and must not contain `@ : / ? #`. The
+  compose file interpolates it into
+  `postgres://paperclip:${POSTGRES_PASSWORD}@postgres:5432/paperclip`, where
+  those characters silently corrupt the connection string with no error from
+  Compose. `openssl rand -hex 32` never produces any of them.
+- `PAPERCLIP_PUBLIC_URL` must not be empty or contain `localhost`/`127.0.0.1`.
+  It is baked into auth callbacks and shown to the first admin, so a localhost
+  value produces an instance nobody outside the host can claim. It legitimately
+  contains `:` and `/`, which is why the stricter `POSTGRES_PASSWORD` pattern
+  must never be applied to it.
+
+No secret is written to disk at any point — not on the runner, not on the
+staging host — which is why there is no cleanup step to delete one.
 
 The Postgres smoke check runs a real authenticated `select 1` rather than
 `pg_isready`, which never authenticates and would return success against a
@@ -391,11 +442,13 @@ why `POSTGRES_PASSWORD` stays a rotatable repository secret and no `ALTER
 USER` step is needed.
 
 Three guards run in the `Verify the paperclip-home guards` step — over plain
-SSH, and *before anything else* in the workflow that touches the host or
-renders a secret (before GHCR login, before the build, before `Verify host
-preconditions`), so a wrong path or owner cannot leave a rendered
-`.env.staging` half-applied and fails in seconds rather than after a full
-build:
+`ssh`, right after the SSH key is loaded and *before* the build, `Verify host
+preconditions` or anything else that touches the host, so a wrong path or owner
+fails in seconds rather than after a full build on the staging host. They stay
+on `ssh` rather than on the job-level `DOCKER_HOST` this step inherits, because
+a `DOCKER_HOST` proxies the Docker API, not a shell, and cannot stat a path on
+the host filesystem. The validator asserts both the `ssh` and the
+before-the-build ordering:
 
 - **The directory is created only under `bootstrap: true`.** Outside
   bootstrap the deploy will never create it: it holds `secrets/master.key`
@@ -457,8 +510,19 @@ network and volume, `trc-shared` staying absent, Postgres publishing no ports,
 and the `depends_on: postgres` ordering being kept. Each **service's** own
 `networks:` membership is asserted too, not just the top-level keys, since a
 top-level network no service joins is silently ignored and an extra one added
-to a service would quietly put it on the backend bridge. For the deploy
-workflow specifically it also asserts:
+to a service would quietly put it on the backend bridge. It also asserts
+`pull_policy: never` on **paperclip** (its image is built straight into the
+host's store and never pushed, so a fallback to GHCR could start a stale tag
+from the retired publish-then-pull scheme) and the **absence** of any
+`pull_policy` on **postgres** (`postgres:17-alpine` is an upstream image
+nothing here builds, so `never` on it would break the first `up -d` on a host
+that does not already have it).
+
+Several workflow assertions below are **deliberate inversions** of the Phase 1
+contract, when the image was built on the runner and pushed to GHCR. Back then
+`DOCKER_HOST` had to be step-scoped, `--env-file` was mandatory and `compose
+pull` had to precede `up -d`; each is now asserted the other way round, with
+the reason recorded on the check itself. For the deploy workflow specifically:
 
 - the job requests the **`self-hosted`** runner label (all three `runs-on`
   spellings understood: scalar, list, and the `{group, labels}` mapping) —
@@ -482,28 +546,41 @@ workflow specifically it also asserts:
   does not unload the key, and a leaked agent keeps it decrypted in memory on
   this persistent runner, one more per dispatch;
 - `docker context create` appears **nowhere** in the workflow;
-- `DOCKER_HOST` appears only as **step-level** `env:`, never at workflow or
-  job level — either would apply to the build step too;
-- `DOCKER_HOST` is present, specifically, on each of the `Verify host
-  preconditions`, `Pull and deploy` and `Smoke test` steps by name — not just
-  "at least one step has it" (which would let it silently go missing from any
-  one of the three while the others stay green);
-- the step running `docker/build-push-action` has no `DOCKER_HOST` in its own
-  `env:` and pins `target: production` — it must build on the runner, not the
-  deploy host, and must never silently publish the later `cloud` stage;
-- the `Verify the paperclip-home guards` step has no `DOCKER_HOST` in its own
-  `env:` and reads ownership with `stat -Lc` — these checks stat a path on
-  the host filesystem, which a `DOCKER_HOST` (an API proxy, not a shell)
-  cannot do;
+- `DOCKER_HOST` is set at **job level** — the build runs on the deploy server,
+  so every `docker` call in the job has to reach that daemon. It is **not** set
+  at workflow level (that would apply to any job added later, including one
+  with no business reaching the host), and **no step overrides it** — a
+  step-level value wins over the job-level one and would silently point that
+  single step at a different daemon than the build and the deploy;
+- no step runs a `docker` command, or a `docker/*` action, **before**
+  `Write SSH key and scan the host key`. Every `docker` call now goes over SSH
+  via the job-level `DOCKER_HOST`, authenticated by the agent that step starts;
+- the step running `docker/build-push-action` sets `push: false` (there is no
+  registry in the loop) and pins `target: production` (the Dockerfile declares
+  a later `cloud` stage, and omitting `target:` would silently deploy it);
+- the step running `docker/setup-buildx-action` pins `driver: docker` — that
+  binds the build to the remote daemon's own persistent layer store. The
+  default `docker-container` driver creates a fresh builder with an **empty
+  cache** on every dispatch, which is the cold 15–45 minute build this whole
+  arrangement exists to avoid;
+- no `docker login`, `docker logout`, or `docker/login-action` anywhere —
+  nothing talks to a registry, and this runner shares `~/.docker/config.json`
+  with sibling repos' concurrent deploys;
+- the `Verify the paperclip-home guards` step reaches the host over plain
+  `ssh`, reads ownership with `stat -Lc`, and runs **before** the build step —
+  these checks stat a path on the host filesystem, which the job-level
+  `DOCKER_HOST` (an API proxy, not a shell) cannot do, and a typo'd path must
+  fail in seconds rather than after a 45-minute cold build;
 - `bootstrap` is declared as a `workflow_dispatch` input, typed `boolean`,
   defaulting to `false`;
 - no line writes raw `ssh-keyscan` output directly onto `known_hosts` outside
   `$RUNNER_TEMP`, whether via a bare `>` or piped through `tee`;
 - the private key is never written to `~/.ssh/id_rsa` anywhere in the
-  workflow — only under `$RUNNER_TEMP`;
-- an `if: always()` cleanup step exists that removes `id_rsa` and
-  `.env.staging` and runs `docker logout` (which is now confined to this job's
-  own `DOCKER_CONFIG` directory, and cannot strip a sibling job's credential);
+  workflow, and no step names `id_rsa` **outside `$RUNNER_TEMP`** at all. This
+  is what makes the removal of the `if: always()` cleanup step safe rather than
+  an oversight: the key is the only secret still reaching disk, and the runner
+  clears `$RUNNER_TEMP` at the start of each job. A key written anywhere else
+  would survive the run and would need an explicit cleanup step back;
 - `docker volume create` and any `mkdir` of the paperclip-home bind-mount
   source (by literal path, `$PAPERCLIP_HOME_DIR`, or `${PAPERCLIP_HOME_DIR}`)
   are each only reachable from inside a branch whose **enclosing** `if`/`elif`
@@ -511,11 +588,19 @@ workflow specifically it also asserts:
   scan, not merely "does `bootstrap` appear earlier in the step", so an
   unconditional create placed *after* that branch's `fi` (i.e. no longer
   actually gated by anything) is still rejected;
-- Compose is invoked with `--env-file`, so secret values are never
-  interpolated into a shell command string;
-- `compose pull` precedes `compose up -d` (same-line `pull && up -d` counts,
-  compared by position within the line), so a deploy can never silently
-  redeploy an image already on the host;
+- Compose is **never** invoked with `--env-file`, and no step writes an env
+  file at all. Secrets reach Compose as the `Deploy` step's own `env:`, so
+  nothing touches disk and nothing is dotenv-parsed;
+- a step named `Deploy` exists and its `env:` declares **every** variable the
+  compose file references. With no `--env-file` that step's own environment is
+  the only source Compose can resolve them from: a `${VAR:?}` reference fails
+  the deploy outright, and a plain `${VAR}` one renders as an empty string with
+  nothing erroring;
+- `compose pull` appears **nowhere**, and `compose up -d` does. The build puts
+  the image directly into the host's image store, so there is nothing to pull —
+  and GHCR still carries tags from the retired publish-then-pull scheme, so a
+  pull would silently replace what this run built with a stale image.
+  `pull_policy: never` in the compose file is the other half of that guard;
 - every heredoc-fed `docker exec` passes `-i`, and no `docker exec` that is
   *not* heredoc-fed passes `-i` — a heredoc without `-i` gets no stdin, so the
   step's body never runs and it still exits 0. This repo's Postgres smoke

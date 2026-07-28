@@ -355,81 +355,36 @@ jobs:
           # poc-net carries no data, so creating it is always safe and idempotent.
           docker network create poc-net 2>/dev/null || true
 
-      # TEMPORARY DIAGNOSTIC -- delete once the Setup pnpm failure is diagnosed.
+      # Node BEFORE pnpm, and the order is load-bearing on this runner.
       #
-      # `Setup pnpm` below dies in ~1s with "self-installer exits with code 1"
-      # on this self-hosted runner, while the identical step (v6, 9.15.4)
-      # passes in pr.yml on ubuntu-latest -- so the action's config is not the
-      # cause, the runner environment is. Every step above proves SSH and the
-      # remote Docker daemon work; NONE of them exercises HTTPS egress to
-      # registry.npmjs.org, which is the first thing the self-installer does.
+      # `pnpm/action-setup` runs a self-installer that shells out to `node` by
+      # name. This self-hosted runner has NO system Node on PATH -- the only
+      # copy is the runner's own bundled one, which hosts the action's JS but
+      # is not on PATH for anything the action spawns. With pnpm first the
+      # installer therefore died in ~1s with a bare "self-installer exits with
+      # code 1" and no other output: the child never got far enough to report
+      # anything, which is why the message names nothing useful.
       #
-      # This probes each boundary the self-installer crosses, in order, so one
-      # dispatch names the failing layer instead of guessing across dispatches.
-      # It prints no secrets (~/.npmrc values are redacted), and `set +e` plus
-      # `exit 0` mean it reports everything rather than dying at the first
-      # failure and cannot fail the deploy on its own.
+      # `actions/setup-node` needs no pre-existing Node -- it installs one into
+      # $RUNNER_TOOL_CACHE and puts it on PATH -- so it is what makes the pnpm
+      # step possible, not the reverse.
       #
-      # Note what step 4 decides: if registry egress is broken, `Refresh
-      # lockfile` below cannot work either, and the fix is network/registry
-      # access on the runner rather than anything to do with pnpm setup.
-      - name: DIAG - probe what Setup pnpm needs
-        run: |
-          set +e
-          echo "=== 1. runner identity / writable paths ==="
-          echo "whoami:      $(whoami)"
-          echo "HOME:        $HOME"
-          echo "HOME write:  $(touch "$HOME/.pnpm-probe" 2>&1 && echo OK && rm -f "$HOME/.pnpm-probe" || echo FAILED)"
-          echo "RUNNER_TOOL_CACHE: ${RUNNER_TOOL_CACHE:-<UNSET>}"
-          if [ -n "${RUNNER_TOOL_CACHE:-}" ]; then
-            mkdir -p "$RUNNER_TOOL_CACHE/pnpm-probe" 2>&1 \
-              && echo "tool cache write: OK" && rmdir "$RUNNER_TOOL_CACHE/pnpm-probe" \
-              || echo "tool cache write: FAILED"
-          fi
-          echo "RUNNER_TEMP: ${RUNNER_TEMP:-<UNSET>}"
-          df -h "$HOME" | tail -1
-
-          echo "=== 2. node available to the action ==="
-          echo "which node:  $(command -v node || echo '<none on PATH>')"
-          echo "node -v:     $(node -v 2>&1 || echo '<failed>')"
-          echo "runner externals:"
-          ls -d "$RUNNER_TOOL_CACHE/../externals"/node* 2>/dev/null \
-            || ls -d ../../externals/node* 2>/dev/null \
-            || echo "  <could not locate runner externals>"
-
-          echo "=== 3. npm/pnpm config that could redirect the install ==="
-          echo "NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-<unset>}"
-          echo "COREPACK_ENABLE_DOWNLOAD: ${COREPACK_ENABLE_DOWNLOAD:-<unset>}"
-          echo "proxy vars: HTTP_PROXY=${HTTP_PROXY:-<unset>} HTTPS_PROXY=${HTTPS_PROXY:-<unset>} NO_PROXY=${NO_PROXY:-<unset>}"
-          echo "http_proxy=${http_proxy:-<unset>} https_proxy=${https_proxy:-<unset>}"
-          echo "--- ~/.npmrc (keys only, values redacted) ---"
-          if [ -f "$HOME/.npmrc" ]; then
-            sed -E 's/=.*/=<redacted>/' "$HOME/.npmrc"
-          else
-            echo "  <no ~/.npmrc>"
-          fi
-
-          echo "=== 4. HTTPS egress to the npm registry (what the self-installer does) ==="
-          echo "--- DNS ---"
-          getent hosts registry.npmjs.org || echo "  DNS LOOKUP FAILED"
-          echo "--- registry metadata (expect HTTP 200) ---"
-          curl -sS -o /dev/null -w 'status=%{http_code} time=%{time_total}s\n' \
-            --max-time 20 https://registry.npmjs.org/pnpm 2>&1
-          echo "--- the exact tarball action-setup fetches (expect HTTP 200) ---"
-          curl -sS -o /dev/null -w 'status=%{http_code} time=%{time_total}s\n' \
-            --max-time 20 https://registry.npmjs.org/pnpm/-/pnpm-9.15.4.tgz 2>&1
-          exit 0
+      # pr.yml has these two in the opposite order and passes, but only because
+      # ubuntu-latest ships Node preinstalled. Do not "align" this file to it.
+      #
+      # The usual reason to want pnpm first -- `cache: pnpm` on setup-node,
+      # which needs a pnpm binary to locate the store -- does not apply here:
+      # no cache is requested, so there is no chicken-and-egg to trade off.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
           version: 9.15.4
           run_install: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 20
 
       - name: Refresh lockfile for Docker build context
         # Runs on the RUNNER even though the build runs on the host: the build

@@ -3,30 +3,36 @@ run-name: Deploy paperclip to Dev/Test Server
 
 # Additive and TRC-only. Builds AND deploys in one run.
 #
-# The BUILD RUNS ON THE DEPLOY HOST, via the job-level DOCKER_HOST below --
-# same arrangement as trc-hermes-agent's and trc-open-webui's deploys. buildx's
-# default container driver starts with an empty cache every dispatch, which
-# made every deploy a cold 15-45 min build; the host's daemon holds the only
-# layer cache that persists. Only the source context crosses the network,
-# never an image.
+# THE BUILD RUNS ON THE RUNNER. DOCKER_HOST is bound PER STEP, never at job
+# level: a job-level binding puts every docker call in the job on the deploy
+# host, the build included, which is the arrangement this replaced. That cost
+# the staging host disk, CPU contention with the live containers, and build
+# time. validate_compose.py asserts the per-step form, and requires every
+# daemon-touching step to declare which daemon it talks to.
 #
-# There is no registry: `push: false` puts the image straight into the deploy
-# host's image store, which is the daemon `docker compose up -d` talks to. The
-# compose service sets `pull_policy: never` so a missing image fails closed
-# instead of reaching out to GHCR, where the retired publish-then-pull scheme
-# left tags that a rollback dispatch could otherwise silently start.
+# The finished image reaches the host as a stream: `docker save` on the runner
+# piped into a `docker load` bound to the host INLINE. Inline is load-bearing
+# -- as a step-level env: it would send the save to the host too, and that
+# fails silently, re-loading whatever image is already there.
+#
+# There is still no registry. `push: false` leaves the image in the runner's
+# store, and the compose service sets `pull_policy: never` so a missing image
+# fails closed instead of reaching out to GHCR, where the retired
+# publish-then-pull scheme left tags that a rollback dispatch could otherwise
+# silently start.
 #
 # ROLLBACK IS HOST-LOCAL. `:git-<7-char-sha>` tags exist only in that host's
-# image store -- a `docker image prune -a` or a host rebuild destroys every
-# rollback target. See docs/deploy/trc-staging.md before pruning there.
+# image store, now bounded to the newest few by the retention step at the end.
+# A `docker image prune -a` or a host rebuild destroys every rollback target.
+# See docs/deploy/trc-staging.md before pruning there.
 #
 # Runs on a SELF-HOSTED runner: the staging host is internal and unreachable
 # from a GitHub-hosted runner.
 #
 # Never `docker context create`/`use` here: this runner is shared with sibling
 # repos (trc-hermes-agent, trc-open-webui) and `use` would repoint the DEFAULT
-# daemon for their jobs too, and would fail "already exists" on the second run
-# besides. The job-level DOCKER_HOST is scoped to this job and cannot leak.
+# daemon for their jobs too -- which would silently put the build back on the
+# deploy host -- and would fail "already exists" on the second run besides.
 #
 # This repo carries two things neither trc-hermes-agent nor trc-open-webui
 # does:
@@ -48,12 +54,9 @@ run-name: Deploy paperclip to Dev/Test Server
 #
 # The build needs a pnpm lockfile refresh first: the Docker build's deps stage
 # installs with a frozen lockfile, so a pnpm-lock.yaml that has drifted from
-# package.json fails the build rather than the app. That refresh still happens
-# on the RUNNER -- the build context is assembled here and uploaded to the
-# host's daemon, so the lockfile it sees is the one this step leaves behind.
-# The build is also pinned to the `production` target explicitly -- the
-# Dockerfile declares a later `cloud` stage, and omitting `target:` would
-# silently deploy that stage instead.
+# package.json fails the build rather than the app. The build is also pinned to
+# the `production` target explicitly -- the Dockerfile declares a later `cloud`
+# stage, and omitting `target:` would silently deploy that stage instead.
 #
 # Other consequences worth knowing:
 #   - no env file is written anywhere. The Deploy step binds the secrets as its
@@ -61,23 +64,21 @@ run-name: Deploy paperclip to Dev/Test Server
 #     that process environment -- so no secret touches disk on the runner or the
 #     server, and nothing is dotenv-parsed, which means a `$`, backtick or `#`
 #     in a value is taken literally instead of interpolated or truncated. The
-#     charset guard the retired `.env.staging` rendering needed is gone with it;
-#     the `@ : / ? #` guard on POSTGRES_PASSWORD is not, being about
-#     DATABASE_URL rather than about parsing
-#   - there is no `docker login` any more, so nothing here mutates the shared
-#     ~/.docker/config.json, and the per-job DOCKER_CONFIG that used to isolate
-#     it -- along with the `docker logout` that made it necessary -- is gone too
+#     `@ : / ? #` guard on POSTGRES_PASSWORD is about DATABASE_URL rather than
+#     about parsing, so it stays
+#   - there is no `docker login`, so nothing here mutates the shared
+#     ~/.docker/config.json
 #   - the /paperclip bind mount already exists on the host and is verified, not
-#     created, so nothing needs to be copied there for compose to start. Its
-#     source is resolved by the REMOTE daemon, so the path must be absolute
-#   - there is NO cleanup step, matching trc-hermes-agent and trc-open-webui.
-#     Nothing secret is written to disk any more except the private key, which
-#     lives only under $RUNNER_TEMP, which the runner clears at the start of
-#     each job, so it cannot collide with a sibling repo's concurrent deploy.
-#     The per-job ssh-agent, however, is left RUNNING: it holds the decrypted
-#     key in memory on this persistent runner until the machine reboots, one
-#     more agent per dispatch. Reap them with `pkill ssh-agent` on the runner
-#     if that accumulation matters
+#     created. Its source is resolved by the REMOTE daemon, so the path must be
+#     absolute
+#   - disk is guarded on BOTH machines now, for different reasons: the runner
+#     needs cold-build headroom, the host only needs room to receive the image
+#   - the two cleanup steps at the end bound each machine's disk and are
+#     `continue-on-error`: they run after a deploy that has already been
+#     smoke-tested, and a cleanup problem must not mark it red
+#   - the per-job ssh-agent is left RUNNING: it holds the decrypted key in
+#     memory on this persistent runner until the machine reboots, one more
+#     agent per dispatch. Reap them with `pkill ssh-agent` if that matters
 #   - ~/.ssh/known_hosts is genuinely shared across sibling jobs on this
 #     runner. The merge below is non-destructive, so the worst case is a
 #     redundant rescan; see docs/deploy/trc-staging.md for the

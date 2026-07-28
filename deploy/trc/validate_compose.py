@@ -26,11 +26,15 @@ over from the retired publish-then-pull scheme) and NO pull_policy on postgres
 would break the first `up -d` on a host that does not already have it).
 
 Several of the deploy-workflow checks in check_deploy_workflow() are DELIBERATE
-INVERSIONS of the contract that held while the image was built on the runner
-and pushed to GHCR. DOCKER_HOST is now required at JOB level rather than banned
-there, `--env-file` is banned rather than required, and `compose pull` is banned
-rather than required to precede `up -d`. Read the reason on each check before
-"restoring" any of them.
+INVERSIONS of an earlier contract. Read the reason on each check before
+"restoring" any of them:
+
+  - `--env-file` is banned rather than required, and `compose pull` is banned
+    rather than required to precede `up -d` -- both from the move off GHCR and
+    off a rendered env file.
+  - DOCKER_HOST is banned at JOB level and required PER STEP. It was required
+    at job level for exactly as long as the build ran on the deploy host; the
+    build runs on the runner now, and a job-level binding would put it back.
 
 Run: python deploy/trc/validate_compose.py
 """
@@ -410,8 +414,9 @@ def _docker_host_values(doc: dict) -> list[tuple[str, str]]:
 
 
 # A step "touches the daemon" when it shells out to `docker` or drives one of
-# the docker/* actions. Under the job-level DOCKER_HOST every one of those goes
-# over SSH, so all of them depend on the ssh-agent the key step sets up.
+# the docker/* actions. Each one has to be classified LOCAL or REMOTE (see
+# LOCAL_DAEMON_STEPS), and the remote ones go over SSH, so they depend on the
+# ssh-agent the key step sets up.
 DOCKER_COMMAND_RE = re.compile(r"(^|[|&;(]\s*)docker\s")
 
 
@@ -475,10 +480,11 @@ def check_deploy_workflow() -> None:
     """Assert the deploy workflow's security and reproducibility invariants.
 
     These are properties a generic YAML linter cannot know about: that the
-    BUILD and the deploy both run against the staging host's daemon via a
-    job-level DOCKER_HOST (never a persistent `docker context`, never at
-    workflow level, and never overridden per step), that buildx binds to that
-    daemon's own persistent layer store, that no registry is in the loop at
+    BUILD runs on the runner while the deploy runs against the staging host's
+    daemon, bound per step (never a persistent `docker context`, never at job
+    or workflow level), that buildx binds to the runner daemon's own persistent
+    layer store, that the image is streamed to the host with `docker save |
+    docker load`, that no registry is in the loop at
     all, that no env file is rendered so every compose variable comes from the
     Deploy step's own `env:`, that the external volume and the paperclip-home
     bind-mount source are verified rather than unconditionally pre-created,
@@ -854,11 +860,14 @@ def check_deploy_workflow() -> None:
                 "to -- there is no job-level DOCKER_HOST to fall back on",
             )
 
-    # Load-bearing only because DOCKER_HOST is job-level: every docker call in
-    # the job now goes over SSH, authenticated by the agent the key step sets
-    # up. A docker call before it fails on host-key verification -- or worse,
-    # on a runner whose $HOME already trusts the host, silently uses whatever
-    # default identity happens to be lying around.
+    # Load-bearing: every REMOTE docker call and every plain ssh in the job goes
+    # over SSH, authenticated by the agent the key step sets up. Such a call
+    # before it fails on host-key verification -- or worse, on a runner whose
+    # $HOME already trusts the host, silently uses whatever default identity
+    # happens to be lying around. Kept as a blanket rule over every
+    # daemon-touching step rather than just the remote ones: the cost of
+    # ordering a local `docker version` after the key step is nil, and a rule
+    # with no exceptions cannot be got wrong when a step is added later.
     ssh_step_index: int | None = None
     for index, step in _steps_with_index(doc):
         if (step or {}).get("name") == "Write SSH key and scan the host key":
@@ -879,7 +888,7 @@ def check_deploy_workflow() -> None:
             "host key scanned before the first one of them",
         )
 
-    # The build now runs ON the deploy host and pushes nowhere.
+    # The build runs on the runner and pushes nowhere.
     build_step = _step_with_uses_containing(doc, "docker/build-push-action")
     check(
         build_step is not None,
@@ -1049,10 +1058,11 @@ def check_deploy_workflow() -> None:
         "runner would survive the run, so it would need an explicit cleanup",
     )
 
-    # Repo-specific: the paperclip-home guards must run on plain SSH. DOCKER_HOST
-    # is job-level now, so this step inherits it -- but a DOCKER_HOST proxies the
-    # Docker API, not a shell, so it can never stat a path on the host
-    # filesystem. The guard has to reach the host over its own ssh.
+    # Repo-specific: the paperclip-home guards must run on plain SSH. There is no
+    # job-level DOCKER_HOST for this step to inherit, and it would not help if
+    # there were -- a DOCKER_HOST proxies the Docker API, not a shell, so it can
+    # never stat a path on the host filesystem. The guard has to reach the host
+    # over its own ssh.
     guard_step = _step_by_name(doc, "Verify the paperclip-home guards")
     check(
         guard_step is not None,
@@ -1083,10 +1093,9 @@ def check_deploy_workflow() -> None:
             guard_index is not None
             and build_index is not None
             and guard_index < build_index,
-            "the paperclip-home guard must run BEFORE the build step -- the "
-            "build happens on the deploy host and can take 45 minutes cold, so "
-            "a typo'd path or a wrong owner has to fail in seconds rather than "
-            "after the whole build",
+            "the paperclip-home guard must run BEFORE the build step -- a cold "
+            "build can take 45 minutes, so a typo'd path or a wrong owner has "
+            "to fail in seconds rather than after the whole build",
         )
 
     # The two value guards that SURVIVED the move off the rendered env file.

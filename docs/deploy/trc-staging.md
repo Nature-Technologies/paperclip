@@ -13,68 +13,92 @@ Bringing Paperclip up is deferrable: it is not required to unblock chat.
 **Build and deploy are one workflow, one dispatch.** There is no separate
 publish step — `trc-publish.yml` is gone.
 
-**The build runs ON the deploy host**, via a **job-level** `DOCKER_HOST`, the
-same arrangement `trc-hermes-agent` and `trc-open-webui` use. buildx's default
-`docker-container` driver starts with an **empty cache on every dispatch**,
-which made each deploy a cold 15–45 minute build; the host daemon's own layer
-store is the only cache that persists between runs. Only the source context
-crosses the network, never an image.
+**The build runs ON THE RUNNER**, against that machine's own daemon and its own
+persistent layer store. It used to run on the deploy host via a **job-level**
+`DOCKER_HOST` — the arrangement `trc-hermes-agent` and `trc-open-webui` still
+use — which cost the staging host disk, CPU contention with the live containers,
+and build time. `Set up Buildx` still pins `driver: docker`; what changed is
+which daemon that binds to.
 
-**There is no registry in the loop.** `push: false` puts the image straight
-into the deploy host's image store, which is the same daemon `docker compose
-up -d` talks to, so the tag the deploy runs always exists by the time it runs
-it — there is nothing to pull. The compose service sets `pull_policy: never`
-so a missing image **fails closed** instead of falling back to GHCR, where the
-retired publish-then-pull scheme left tags that a rollback dispatch could
-otherwise silently start. Nothing logs in to a registry, which is what makes
-the old per-job `DOCKER_CONFIG` (and the `docker logout` that required it)
-removable.
+**The image reaches the host as a stream.** `Ship the image to the host` pipes
+`docker save` straight into a `docker load` bound to the host, so the image
+never lands on the runner's disk as a tarball. `docker load` over an `ssh://`
+endpoint streams the tar to the remote daemon through the Docker CLI's own SSH
+transport, which means the staging host needs **nothing but `dockerd`** — no
+docker CLI, no `zstd`, no registry. `Confirm the image landed on the host`
+inspects the tag before compose is touched, so a truncated or silently failed
+transfer never reaches `up -d`.
+
+**There is no registry in the loop.** `push: false` leaves the image in the
+runner's store; the transfer puts it in the host's, which is the same daemon
+`docker compose up -d` talks to, so the tag the deploy runs always exists by the
+time it runs it — there is nothing to pull. The compose service sets
+`pull_policy: never` so a missing image **fails closed** instead of falling back
+to GHCR, where the retired publish-then-pull scheme left tags that a rollback
+dispatch could otherwise silently start. Nothing logs in to a registry, which is
+what makes the old per-job `DOCKER_CONFIG` (and the `docker logout` that
+required it) removable.
 
 > **Rollback targets are host-local.** `:git-<7-char-sha>` tags exist only in
-> that host's image store. A `docker image prune -a` there, or a host rebuild,
-> destroys **every** rollback target. Read "Rolling back" below before pruning
-> on the staging host.
+> that host's image store, and `Prune old images on the host` now bounds them to
+> the **newest 5** — so the rollback window is five deploys deep, not unbounded.
+> A `docker image prune -a` there, or a host rebuild, destroys **every** rollback
+> target. Read "Rolling back" below before pruning on the staging host.
 
 The workflow runs on a **self-hosted runner** (`runs-on: self-hosted`) because
 the staging host is internal and unreachable from a GitHub-hosted runner.
 
-Because `DOCKER_HOST` is job-level, **every** `docker` call in the job — the
-build included — goes to the staging host over SSH. Two consequences follow
-directly:
+`DOCKER_HOST` is bound **per step**, and job level is **banned** — a job-level
+binding is precisely what would drag the build back onto the staging host. With
+no default to inherit, every step that shells out to `docker` has to declare
+which daemon it talks to, and the validator holds it to one of three groups:
 
-- **`Write SSH key and scan the host key` must be the first step after
-  checkout.** The `ssh` the Docker CLI spawns internally for `DOCKER_HOST` is
-  authenticated by the per-job `ssh-agent` that step starts, so any `docker`
-  call placed ahead of it fails host-key verification. The validator asserts
-  the ordering.
+- **Local** (`Verify the runner can build`, `Set up Buildx`, `Build the image on
+  the runner`, `Cap the runner's build cache`) — must set **no** `DOCKER_HOST`.
+- **Remote** (`Verify host preconditions`, `Confirm the image landed on the
+  host`, `Deploy`, `Smoke test`, `Prune old images on the host`) — each sets its
+  own `DOCKER_HOST` in its `env:`.
+- **The transfer step**, which is neither. `Ship the image to the host` binds
+  the endpoint **inline on the `docker load` only**. As a step-level `env:` it
+  would send `docker save` to the host as well — and that fails *silently*: a
+  `:git-<sha>` image already present there would be saved and re-loaded,
+  deploying whatever the host was already running instead of what the run built.
+
+A daemon-touching step in none of the three fails the validator, so adding a
+step later forces the decision instead of letting it inherit one.
+
+Two consequences follow directly:
+
+- **`Write SSH key and scan the host key` must come before any `docker` or
+  `ssh` call.** The `ssh` the Docker CLI spawns internally for a remote
+  `DOCKER_HOST` is authenticated by the per-job `ssh-agent` that step starts, so
+  a remote call placed ahead of it fails host-key verification. The validator
+  asserts the ordering over *every* daemon-touching step, local ones included:
+  ordering a local `docker version` after the key step costs nothing, and a rule
+  with no exceptions cannot be got wrong later.
 - **Never a `docker context`.** A context is *persistent state* on a
   self-hosted runner: `docker context create` fails "already exists" on the
   second run, and `docker context use` repoints that runner's **default**
-  daemon for every later job on the machine, including `trc-hermes-agent`'s
-  and `trc-open-webui`'s. The job-level `DOCKER_HOST` is scoped to this job and
-  cannot leak. A **step-level** `DOCKER_HOST` is banned too now — it would
-  *override* the job-level one and silently point that single step at a
-  different daemon than the build and the deploy.
+  daemon for every later job on the machine, including `trc-hermes-agent`'s and
+  `trc-open-webui`'s — which would silently put this build back on the deploy
+  host. A step-scoped `DOCKER_HOST` cannot leak that way.
 
-The build still needs a **pnpm lockfile refresh** first, and that refresh still
-runs **on the runner**: the build context is assembled here and uploaded to the
-host's daemon, so the `pnpm-lock.yaml` the `deps` stage installs from is the
-one this step leaves behind. The Docker build installs with a frozen lockfile,
-so a lockfile that has drifted from `package.json` fails the build rather than
-the app. `Setup pnpm` (`pnpm/action-setup@v6`, pinned to `9.15.4`,
-`run_install: false`) and `Setup Node.js` (`actions/setup-node@v7`, node 20)
-run before `Refresh lockfile for Docker build context`
-(`pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile`), which
-in turn runs before `Set up Buildx`. `Set up Buildx` pins `driver: docker` —
-that is the whole performance argument, since it binds the build to the remote
-daemon's own persistent layer store. `Build the image on the deploy server`
-pins `target: production` explicitly — the Dockerfile declares a later `cloud`
-stage, and omitting `target:` would silently deploy that stage instead. It sets
-no `platforms` (build native to the server, or buildx switches on QEMU
-emulation), no `cache-from`/`cache-to` (the daemon's own layer store *is* the
-cache now, and the `docker` driver cannot use the gha backend anyway), and
-`provenance: false` (attestations force a manifest list and an extra export
-pass for nothing).
+The build needs a **pnpm lockfile refresh** first: the Docker build installs
+with a frozen lockfile, so a lockfile that has drifted from `package.json` fails
+the build rather than the app. `Setup pnpm` (`pnpm/action-setup@v6`, pinned to
+`9.15.4`, `run_install: false`) and `Setup Node.js` (`actions/setup-node@v7`,
+node 20) run before `Refresh lockfile for Docker build context`
+(`pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile`), which in
+turn runs before `Set up Buildx`. `Set up Buildx` pins `driver: docker` — that
+is the whole performance argument, since it binds the build to the runner
+daemon's own persistent layer store. `Build the image on the runner` pins
+`target: production` explicitly — the Dockerfile declares a later `cloud` stage,
+and omitting `target:` would silently deploy that stage instead. It sets no
+`platforms` (the runner and the deploy host are both linux/amd64, and naming one
+switches on QEMU emulation), no `cache-from`/`cache-to` (the daemon's own layer
+store *is* the cache, and the `docker` driver cannot use the gha backend
+anyway), and `provenance: false` (attestations force a manifest list and an
+extra export pass for nothing).
 
 Three consequences of this design worth knowing:
 
@@ -94,11 +118,19 @@ Three consequences of this design worth knowing:
   starts** so a typo'd path fails in seconds rather than after a full build.
   Bind-mount sources are resolved by the **remote** daemon, so the path must be
   absolute and must already exist on the server.
-- **Free disk on the host is now a precondition of the build itself**, not just
-  of the deploy. `Verify host preconditions` reads `df` over SSH and fails
-  under 10 GB, warns under 25 GB — BuildKit's out-of-space failures name
-  everything except the cause, and a full disk has to fail in seconds rather
-  than 28 minutes in.
+- **Disk is guarded on both machines, for different reasons.** `Verify the
+  runner can build` reads `df` locally and fails under 15 GB, warns under 30 GB
+  — that is where cold-build headroom is needed now, and BuildKit's
+  out-of-space failures name everything except the cause. `Verify host
+  preconditions` reads `df` over SSH and fails under 10 GB, warns under 20 GB:
+  the host no longer builds, but the incoming image load still needs room for
+  the new image alongside the one running.
+- **Both machines are bounded after a successful deploy.** `Prune old images on
+  the host` keeps the newest 5 `:git-<sha>` images plus whatever is running;
+  `Cap the runner's build cache` prunes the runner's build cache to 30 GB and
+  drops the runner's copy of the shipped image. Both are `continue-on-error` —
+  they run after a deploy that has already been smoke-tested, and a cleanup
+  problem must not mark it red. All four numbers are starting values.
 
 **The runner is persistent and SHARED.** Unlike a GitHub-hosted runner, this
 machine is reused by later jobs — including `trc-hermes-agent` and
@@ -114,9 +146,9 @@ as a category; only `known_hosts` is still genuinely shared:
   runner clears it at the start of each one, which makes that impossible. The
   agent authenticates both the explicit `ssh` calls (which also pass
   `-i "$RUNNER_TEMP/id_rsa"` explicitly, redundantly with the agent, since that
-  costs nothing) and — load-bearing under a job-level `DOCKER_HOST` — the `ssh`
-  the Docker CLI spawns internally for **every** `docker` call in the job,
-  including the build.
+  costs nothing) and — load-bearing — the `ssh` the Docker CLI spawns
+  internally for every **remote** `docker` call in the job. The build is not
+  one of them: it runs against the runner's own daemon and needs no SSH at all.
 - **`~/.docker/config.json` is no longer touched at all.** Nothing logs in to a
   registry, so there is no credential to isolate, no `docker logout` that could
   strip a sibling job's credential mid-deploy, and no per-job `DOCKER_CONFIG`
@@ -252,9 +284,32 @@ is violated. Neither does `~/.docker/config.json`, which nothing in the
 workflow touches any more. **`known_hosts` is the only genuinely shared file
 left**, which is why this requirement is about that file specifically.
 
-The runner also needs enough **free disk on the staging host**, not on itself:
-the build happens there now. `Verify host preconditions` fails under 10 GB and
-warns under 25 GB before the build starts.
+The runner also needs **its own local Docker daemon** and **its own free disk**:
+the build happens there now. `Verify the runner can build` proves the daemon
+exists — failing immediately, with the fallback named, if it does not — and
+fails under 15 GB free, warns under 30 GB. It runs before the lockfile refresh
+so a runner that cannot build costs seconds rather than a full `pnpm install`
+first. The staging host is still guarded, but only for room to receive the
+image: `Verify host preconditions` fails under 10 GB and warns under 20 GB.
+
+> If the runner turns out to have no local daemon, the shape of the deploy
+> survives — build somewhere that is not the staging host, ship over SSH — but
+> the build needs a dedicated build host and the preflight becomes a remote
+> check.
+
+### Migration: reclaiming the old build cache
+
+The staging host still holds whatever BuildKit cache accumulated while the build
+ran there. It is never written to again, so after the first dispatch under this
+scheme, reclaim it once:
+
+```sh
+docker builder prune -a          # on the STAGING HOST
+```
+
+That is `builder prune`, **not** `docker image prune -a`. The latter destroys
+every `:git-<sha>` rollback target on that host; the former only touches build
+cache, which nothing needs any more.
 
 ### Phase 2 preconditions
 
@@ -301,9 +356,9 @@ tags read the same as they did under the retired publish-then-pull scheme.
 2. Leave `bootstrap` unchecked (default `false`) unless this is the first
    deploy to a brand-new host or a deliberate first deploy of a fresh
    instance (see "First-run bootstrap" below).
-3. The workflow builds the image **on the staging host** from the checked-out
-   ref (`target: production`, after refreshing the pnpm lockfile on the
-   runner), tags it twice there, and deploys the `:git-<7-char-sha>` one.
+3. The workflow builds the image **on the runner** from the checked-out ref
+   (`target: production`, after refreshing the pnpm lockfile), tags it twice,
+   streams it to the staging host, and deploys the `:git-<7-char-sha>` one.
 
 The `Deploy` step echoes `$PAPERCLIP_IMAGE` — the same variable Compose
 resolves — so the log line can never drift from what is actually running,
@@ -363,9 +418,9 @@ not resolve here.
 | Secret | Notes |
 |---|---|
 | `SSH_PRIVATE_KEY_DEV` | Deploy user's private key |
-| `HOST` | Staging host, used for `ssh-keyscan`, the paperclip-home guard's plain `ssh`, the disk-space and fingerprint reads, and the job-level `DOCKER_HOST: ssh://${USERNAME}@${HOST}:${SSH_PORT}` that every `docker` call — the build included — goes through |
+| `HOST` | Staging host, used for `ssh-keyscan`, the paperclip-home guard's plain `ssh`, the disk-space and fingerprint reads, and the per-step `DOCKER_HOST: ssh://${USERNAME}@${HOST}:${SSH_PORT}` that every **remote** `docker` call goes through — not the build, which runs locally |
 | `USERNAME` | Deploy user on the host |
-| `SSH_PORT` | Optional, defaults to 22. Threaded through every consumer that needs it: the `ssh-keyscan` that seeds `known_hosts`, the paperclip-home guard's `ssh` call, the job-level `DOCKER_HOST`, and the disk-space and fingerprint reads over `ssh` — a mismatch between any of these would scan or dial a different endpoint than the others |
+| `SSH_PORT` | Optional, defaults to 22. Threaded through every consumer that needs it: the `ssh-keyscan` that seeds `known_hosts`, the paperclip-home guard's `ssh` call, every per-step `DOCKER_HOST` (and the transfer step's `REMOTE_DOCKER_HOST`), and the disk-space and fingerprint reads over `ssh` — a mismatch between any of these would scan or dial a different endpoint than the others |
 | `POSTGRES_PASSWORD` | Also interpolated into `DATABASE_URL`. The workflow rejects an empty value or one containing `@ : / ? #`, since those characters silently corrupt the connection string with no error from compose |
 | `BETTER_AUTH_SECRET`, `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` | `openssl rand -hex 32` |
 | `OPENROUTER_API_KEY` | |
@@ -444,10 +499,10 @@ USER` step is needed.
 Three guards run in the `Verify the paperclip-home guards` step — over plain
 `ssh`, right after the SSH key is loaded and *before* the build, `Verify host
 preconditions` or anything else that touches the host, so a wrong path or owner
-fails in seconds rather than after a full build on the staging host. They stay
-on `ssh` rather than on the job-level `DOCKER_HOST` this step inherits, because
-a `DOCKER_HOST` proxies the Docker API, not a shell, and cannot stat a path on
-the host filesystem. The validator asserts both the `ssh` and the
+fails in seconds rather than after a full build. They stay on `ssh` rather than
+on a `DOCKER_HOST` because a `DOCKER_HOST` proxies the Docker API, not a shell,
+and cannot stat a path on the host filesystem — this step sets none at all. The
+validator asserts both the `ssh` and the
 before-the-build ordering:
 
 - **The directory is created only under `bootstrap: true`.** Outside
@@ -546,31 +601,42 @@ the reason recorded on the check itself. For the deploy workflow specifically:
   does not unload the key, and a leaked agent keeps it decrypted in memory on
   this persistent runner, one more per dispatch;
 - `docker context create` appears **nowhere** in the workflow;
-- `DOCKER_HOST` is set at **job level** — the build runs on the deploy server,
-  so every `docker` call in the job has to reach that daemon. It is **not** set
-  at workflow level (that would apply to any job added later, including one
-  with no business reaching the host), and **no step overrides it** — a
-  step-level value wins over the job-level one and would silently point that
-  single step at a different daemon than the build and the deploy;
+- `DOCKER_HOST` is **banned at job level** — that is what would put the build
+  back on the staging host — and banned at workflow level too (it would apply
+  to any job added later, including one with no business reaching the host).
+  Instead every daemon-touching step is classified: the remote ones each set
+  their own `DOCKER_HOST`, the local ones set none, and `Ship the image to the
+  host` sets none in its `env:` but binds one **inline** on its `docker load`.
+  A daemon-touching step in none of the three groups fails the check;
+- the `docker/build-push-action` step sets no `DOCKER_HOST` at all, and the
+  step order is build → ship → confirm → deploy;
+- `docker image prune -a` appears **nowhere** — it would destroy every
+  host-local rollback target — and both cleanup steps set
+  `continue-on-error: true`;
 - no step runs a `docker` command, or a `docker/*` action, **before**
-  `Write SSH key and scan the host key`. Every `docker` call now goes over SSH
-  via the job-level `DOCKER_HOST`, authenticated by the agent that step starts;
+  `Write SSH key and scan the host key`. Every remote `docker` call goes over
+  SSH, authenticated by the agent that step starts;
 - the step running `docker/build-push-action` sets `push: false` (there is no
   registry in the loop) and pins `target: production` (the Dockerfile declares
   a later `cloud` stage, and omitting `target:` would silently deploy it);
 - the step running `docker/setup-buildx-action` pins `driver: docker` — that
-  binds the build to the remote daemon's own persistent layer store. The
+  binds the build to the **runner** daemon's own persistent layer store. The
   default `docker-container` driver creates a fresh builder with an **empty
   cache** on every dispatch, which is the cold 15–45 minute build this whole
   arrangement exists to avoid;
+- `Verify the runner can build` exists, runs `docker version` locally, and
+  comes before the lockfile refresh;
+- `Ship the image to the host` exists, pipes `docker save` into `docker load`,
+  and `Prune old images on the host` and `Cap the runner's build cache` both
+  exist;
 - no `docker login`, `docker logout`, or `docker/login-action` anywhere —
   nothing talks to a registry, and this runner shares `~/.docker/config.json`
   with sibling repos' concurrent deploys;
 - the `Verify the paperclip-home guards` step reaches the host over plain
   `ssh`, reads ownership with `stat -Lc`, and runs **before** the build step —
-  these checks stat a path on the host filesystem, which the job-level
-  `DOCKER_HOST` (an API proxy, not a shell) cannot do, and a typo'd path must
-  fail in seconds rather than after a 45-minute cold build;
+  these checks stat a path on the host filesystem, which a `DOCKER_HOST` (an
+  API proxy, not a shell) cannot do, and a typo'd path must fail in seconds
+  rather than after a 45-minute cold build;
 - `bootstrap` is declared as a `workflow_dispatch` input, typed `boolean`,
   defaulting to `false`;
 - no line writes raw `ssh-keyscan` output directly onto `known_hosts` outside

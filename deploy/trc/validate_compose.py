@@ -63,6 +63,39 @@ NO_PORTS_SERVICES = {"postgres"}
 # `up` would object.
 EXPECTED_SERVICE_NETWORKS = {"paperclip": {"poc-net"}, "postgres": {"poc-net"}}
 
+# Env keys that carry a remote daemon endpoint. `DOCKER_HOST` binds a whole
+# step to the staging host; `REMOTE_DOCKER_HOST` is the transfer step's
+# endpoint, bound INLINE on the `docker load` side only (see TRANSFER_STEP).
+# Both must be built from secrets rather than hardcoded, so both are collected
+# by _docker_host_values() -- but only the exact name `DOCKER_HOST` classifies
+# a step as remote.
+REMOTE_HOST_ENV_KEYS = ("DOCKER_HOST", "REMOTE_DOCKER_HOST")
+
+# With no job-level DOCKER_HOST, every step that shells out to `docker` reaches
+# one daemon or the other, and which one has to be asserted rather than
+# inferred. A daemon-touching step in none of these three groups fails the
+# validator, so adding a step later forces the decision.
+#
+# LOCAL: the runner's own daemon. Must NOT set DOCKER_HOST -- the build staying
+# here is the entire point of this arrangement.
+LOCAL_DAEMON_STEPS = {
+    "Build the image on the runner",
+    "Set up Buildx",
+}
+# REMOTE: the staging host's daemon. Each must set its own DOCKER_HOST.
+REMOTE_DAEMON_STEPS = {
+    "Confirm the image landed on the host",
+    "Deploy",
+    "Smoke test",
+    "Verify host preconditions",
+}
+# Neither: `docker save` runs locally and pipes into a `docker load` that is
+# bound to the host INLINE. A step-level DOCKER_HOST here would send the save to
+# the host as well -- and that fails SILENTLY, because a `:git-<sha>` image
+# already present there would be saved and re-loaded, deploying whatever the
+# host was already running instead of what this run built.
+TRANSFER_STEP = "Ship the image to the host"
+
 failures: list[str] = []
 
 
@@ -351,23 +384,24 @@ def _environment_name(job: dict) -> str | None:
 
 
 def _docker_host_values(doc: dict) -> list[tuple[str, str]]:
-    """Every DOCKER_HOST value in the workflow, with where it was found.
+    """Every remote-endpoint value in the workflow, with where it was found.
 
-    Keyed on the exact name `DOCKER_HOST`, so sibling variables that merely
-    start with `DOCKER_` are not collected here and cannot trip the
-    DOCKER_HOST assertions.
+    Keyed on REMOTE_HOST_ENV_KEYS, so a sibling variable that merely starts
+    with `DOCKER_` is not collected here and cannot trip these assertions,
+    while the transfer step's REMOTE_DOCKER_HOST is still held to the same
+    built-from-secrets rule.
     """
     found: list[tuple[str, str]] = []
     for key, value in (doc.get("env") or {}).items():
-        if key == "DOCKER_HOST":
+        if key in REMOTE_HOST_ENV_KEYS:
             found.append(("workflow-level env", str(value)))
     for job_name, job in (doc.get("jobs") or {}).items():
         for key, value in (((job or {}).get("env")) or {}).items():
-            if key == "DOCKER_HOST":
+            if key in REMOTE_HOST_ENV_KEYS:
                 found.append((f"job {job_name!r} env", str(value)))
         for step in (job or {}).get("steps") or []:
             for key, value in (((step or {}).get("env")) or {}).items():
-                if key == "DOCKER_HOST":
+                if key in REMOTE_HOST_ENV_KEYS:
                     found.append((f"step {(step or {}).get('name')!r} env", str(value)))
     return found
 
@@ -753,44 +787,69 @@ def check_deploy_workflow() -> None:
         )
 
     # INVERTED IN PHASE 2, and the inversion is the whole point of the change:
-    # DOCKER_HOST is now JOB-level because the BUILD is supposed to run on the
-    # deploy host. buildx's default container driver starts with an empty cache
-    # on every dispatch, which made each deploy a cold 15-45 minute build; the
-    # host daemon's own layer store is the only cache that persists between
-    # runs. Workflow level is still banned -- it would apply to any job added
-    # later, including one that has no business talking to the deploy host --
-    # and so is a step-level override, which would silently take one step off
-    # the host daemon while every other step stays on it.
+    # Inverted: DOCKER_HOST was REQUIRED here while the build ran on the deploy
+    # host. It is banned now for exactly the same reason it was required then --
+    # a job-level binding puts every docker call in the job, the build included,
+    # on the staging host, and moving the build off that machine is the entire
+    # point. Workflow level stays banned as it always was.
     job_level_docker_host = [
         name for name, job in (doc.get("jobs") or {}).items()
         if "DOCKER_HOST" in set(((job or {}).get("env")) or {})
     ]
     check(
-        bool(job_level_docker_host),
-        "DOCKER_HOST must be set at JOB level -- the build runs on the deploy "
-        "server now, so every docker call in the job, the build included, has "
-        "to talk to that daemon. Without it the build would run on the runner "
-        "against a buildx cache that starts empty every dispatch, and `compose "
-        "up -d` would start the stack on the runner instead of the host",
+        not job_level_docker_host,
+        f"jobs {job_level_docker_host} set DOCKER_HOST at JOB level -- that "
+        "puts every docker call in the job on the staging host, the build "
+        "included, which is the arrangement this replaced. The build has to run "
+        "on the runner, so bind DOCKER_HOST per step instead",
     )
     check(
         "DOCKER_HOST" not in set(doc.get("env") or {}),
         "DOCKER_HOST must not be set at WORKFLOW level -- that would apply to "
         "every job added later too, including ones with no business reaching "
-        "the deploy host. Scope it to the deploy job",
+        "the deploy host. Scope it to the individual steps",
     )
-    step_level_docker_host = [
-        (step or {}).get("name")
-        for _, step in _steps_with_index(doc)
-        if "DOCKER_HOST" in _step_env_keys(step)
-    ]
-    check(
-        not step_level_docker_host,
-        f"steps {step_level_docker_host} set their own DOCKER_HOST -- a "
-        "step-level value OVERRIDES the job-level one, so it would silently "
-        "point that one step at a different daemon than the build and the "
-        "deploy. The job-level binding is the single source of truth",
-    )
+
+    # Inverted with it: a step-level DOCKER_HOST was banned as an override of
+    # the job-level binding. With no job-level binding there is nothing to
+    # override, and it is now the ONLY thing that sends a step to the host.
+    for _, step in _steps_with_index(doc):
+        if not _step_touches_daemon(step):
+            continue
+        step_name = (step or {}).get("name")
+        binds_host = "DOCKER_HOST" in _step_env_keys(step)
+        if step_name == TRANSFER_STEP:
+            check(
+                not binds_host,
+                f"the {step_name!r} step sets DOCKER_HOST in its `env:` -- that "
+                "would send `docker save` to the staging host too, and it fails "
+                "SILENTLY: an image already there would be saved and re-loaded, "
+                "deploying what the host was already running instead of what "
+                "this run built. Bind it inline on the `docker load` side only",
+            )
+        elif step_name in LOCAL_DAEMON_STEPS:
+            check(
+                not binds_host,
+                f"the {step_name!r} step sets DOCKER_HOST -- it must run against "
+                "the RUNNER's own daemon. Moving the build off the staging host "
+                "is what this workflow exists to do",
+            )
+        elif step_name in REMOTE_DAEMON_STEPS:
+            check(
+                binds_host,
+                f"the {step_name!r} step drives the staging host's daemon but "
+                "sets no DOCKER_HOST in its `env:` -- there is no job-level "
+                "binding to inherit any more, so it would silently run against "
+                "the runner's own daemon",
+            )
+        else:
+            check(
+                False,
+                f"the {step_name!r} step shells out to docker but is in none of "
+                "LOCAL_DAEMON_STEPS, REMOTE_DAEMON_STEPS or TRANSFER_STEP. "
+                "Every daemon-touching step must declare which daemon it talks "
+                "to -- there is no job-level DOCKER_HOST to fall back on",
+            )
 
     # Load-bearing only because DOCKER_HOST is job-level: every docker call in
     # the job now goes over SSH, authenticated by the agent the key step sets
@@ -1068,9 +1127,67 @@ def check_deploy_workflow() -> None:
             and secrets_index < build_index,
             f"the {secrets_step_name!r} step must run BEFORE the build -- a "
             "secret this shape cannot produce a working deploy, and finding "
-            "that out after a cold build on the deploy host wastes the whole "
-            "run",
+            "that out after a cold build wastes the whole run",
         )
+
+    # The single assertion that encodes "the build does not run on the staging
+    # host". The job-level ban above is necessary but not sufficient: a step
+    # env: on the build step alone would put it back.
+    build_step = next(
+        (
+            step for _, step in _steps_with_index(doc)
+            if "docker/build-push-action" in str((step or {}).get("uses") or "")
+        ),
+        None,
+    )
+    check(
+        build_step is not None and "DOCKER_HOST" not in _step_env_keys(build_step),
+        "the docker/build-push-action step must not set DOCKER_HOST -- the "
+        "build runs on the runner now, against its own persistent layer store",
+    )
+
+    transfer_step = _step_by_name(doc, TRANSFER_STEP)
+    check(
+        transfer_step is not None,
+        f"no step named {TRANSFER_STEP!r} -- the build no longer runs on the "
+        "deploy host, so the image has to be streamed there before compose can "
+        "start it. Without this step `up -d` finds no image and "
+        "`pull_policy: never` fails it closed",
+    )
+    if transfer_step is not None:
+        transfer_lines = _script_lines(transfer_step.get("run") or "")
+        piped = [
+            ln for ln in transfer_lines
+            if "docker save" in ln and "docker load" in ln
+        ]
+        check(
+            bool(piped),
+            f"the {TRANSFER_STEP!r} step must pipe `docker save` straight into "
+            "`docker load` -- streaming to the remote daemon means the image "
+            "never lands on the runner's disk as a tarball",
+        )
+        check(
+            all(
+                re.search(r"\|\s*DOCKER_HOST=\S+\s+docker\s+load", ln)
+                for ln in piped
+            ),
+            f"the `docker load` in {TRANSFER_STEP!r} must be prefixed by an "
+            "INLINE DOCKER_HOST= binding. Inline is what keeps `docker save` on "
+            "the runner while the load goes to the host",
+        )
+
+    build_index = _build_step_index(doc)
+    transfer_index = _step_index(doc, TRANSFER_STEP)
+    landed_index = _step_index(doc, "Confirm the image landed on the host")
+    deploy_index = _step_index(doc, "Deploy")
+    check(
+        None not in (build_index, transfer_index, landed_index, deploy_index)
+        and build_index < transfer_index < landed_index < deploy_index,
+        "the step order must be build -> ship -> confirm -> deploy (got "
+        f"{build_index}, {transfer_index}, {landed_index}, {deploy_index}). The "
+        "confirmation is what stops a truncated or silently failed transfer "
+        "from reaching `compose up`",
+    )
 
 
 def report() -> int:

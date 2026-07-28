@@ -119,12 +119,9 @@ jobs:
     runs-on: self-hosted
     environment: staging
     timeout-minutes: 60
-    env:
-      # Job-wide ON PURPOSE: the BUILD runs on the deploy server, not just the
-      # deploy. Every docker command below therefore talks to that daemon over
-      # SSH -- which is why the SSH key step must come first, before anything
-      # that shells out to docker.
-      DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
+    # No job-level env: DOCKER_HOST is bound PER STEP below. A job-level
+    # binding would put every docker call in this job on the staging host, the
+    # build included, which is the arrangement this replaced.
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -294,6 +291,7 @@ jobs:
       # must fail in seconds, not 28 minutes in.
       - name: Verify host preconditions
         env:
+          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
           BOOTSTRAP: ${{ inputs.bootstrap }}
           HOST: ${{ secrets.HOST }}
           USERNAME: ${{ secrets.USERNAME }}
@@ -400,13 +398,14 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
         with:
-          # The remote daemon's OWN builder, reached through the job-level
-          # DOCKER_HOST. The default container driver would start empty on
-          # every dispatch, which is the failure this whole arrangement exists
-          # to avoid.
+          # The RUNNER's own daemon, and no DOCKER_HOST anywhere in scope to
+          # send it elsewhere. `driver: docker` binds the build to that daemon's
+          # persistent layer store, which is what keeps the cache warm between
+          # dispatches now that the deploy host no longer holds it. The default
+          # container driver would start empty on every dispatch.
           driver: docker
 
-      - name: Build the image on the deploy server
+      - name: Build the image on the runner
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -414,20 +413,66 @@ jobs:
           # later `cloud` stage, and without a target the default would
           # silently become that stage instead.
           target: production
-          # No registry: built straight into the deploy host's image store,
-          # which is the same daemon `docker compose up -d` talks to below.
+          # No registry, and with `driver: docker` no `load:` either -- the
+          # build writes straight into the runner's image store, which is what
+          # the next step streams to the deploy host.
           push: false
           tags: |
             ${{ steps.tags.outputs.staging }}
             ${{ steps.tags.outputs.sha }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
-          # No `platforms`: build native to the server, or buildx silently
-          # switches on QEMU emulation. No cache-from/to: the daemon's own
-          # layer store is the cache now, and the docker driver cannot use the
-          # gha cache backend anyway. No attestations: they force a manifest
-          # list and an extra export pass for nothing.
+          # No `platforms`: the runner and the deploy host are both linux/amd64,
+          # and naming one switches on QEMU emulation. No cache-from/to: the
+          # runner daemon's own layer store is the cache, and the docker driver
+          # cannot use the gha cache backend anyway. No attestations: they force
+          # a manifest list and an extra export pass for nothing.
           provenance: false
+
+      - name: Ship the image to the host
+        # The image is built on the runner now, so it has to reach the deploy
+        # host's image store before compose can start it.
+        #
+        # DOCKER_HOST is bound INLINE on the `docker load` only, never as this
+        # step's `env:`. A step-level binding would send `docker save` to the
+        # host as well, and that failure is silent rather than loud: a
+        # :git-<sha> image already present there would be saved and re-loaded,
+        # deploying whatever the host was already running instead of what this
+        # run built. validate_compose.py asserts the inline form.
+        #
+        # `docker load` over an ssh:// endpoint streams the tar to the remote
+        # daemon through the Docker CLI's own SSH transport, so the host needs
+        # nothing but dockerd -- no docker CLI, no zstd, no registry. Both tags
+        # name the same image, so one stream carries both and the layers are
+        # shared.
+        #
+        # Uncompressed on purpose to start with. If a dispatch shows the
+        # transfer is slow, the fallback is
+        #   docker save ... | zstd -T0 | ssh "$USER@$HOST" 'zstd -d | docker load'
+        # which needs zstd on both machines and a docker CLI on the host.
+        env:
+          REMOTE_DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
+          SHA_TAG: ${{ steps.tags.outputs.sha }}
+          STAGING_TAG: ${{ steps.tags.outputs.staging }}
+        run: |
+          set -eu
+          echo "shipping $SHA_TAG to the deploy host"
+          docker save "$SHA_TAG" "$STAGING_TAG" | DOCKER_HOST="$REMOTE_DOCKER_HOST" docker load
+
+      - name: Confirm the image landed on the host
+        # A truncated or silently failed transfer must not reach `compose up`.
+        # Without this, `up -d` would either start the PREVIOUS image or fail
+        # closed on pull_policy: never -- the first of which is silent.
+        env:
+          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
+          SHA_TAG: ${{ steps.tags.outputs.sha }}
+        run: |
+          set -eu
+          if ! docker image inspect "$SHA_TAG" >/dev/null 2>&1; then
+            echo "::error::$SHA_TAG is not in the deploy host's image store after the transfer. Nothing has been deployed; the previous image is still running. Re-dispatch."
+            exit 1
+          fi
+          echo "$SHA_TAG is present on the deploy host"
 
       - name: Deploy
         # Compose resolves the compose file's ${...} references from THIS
@@ -440,6 +485,7 @@ jobs:
         # there is no other source for them; deploy/trc/validate_compose.py
         # asserts exactly that.
         env:
+          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
           # The IMMUTABLE tag this run built, not the moving `:staging`
           # pointer -- so the deploy runs exactly what this run built and "what
           # is running" is unambiguous. To roll back, hardcode an older
@@ -458,9 +504,10 @@ jobs:
         run: |
           set -eu
           echo "deploying $PAPERCLIP_IMAGE"
-          # No `pull`: the build above already put the image in THIS daemon's
-          # store, and the compose service sets `pull_policy: never` so a
-          # missing image fails closed instead of reaching for GHCR. Postgres
+          # No `pull`: the transfer step above streamed the image into THIS
+          # daemon's store and the step after it confirmed it arrived, and the
+          # compose service sets `pull_policy: never` so a missing image fails
+          # closed instead of reaching for GHCR. Postgres
           # keeps the default policy -- postgres:17-alpine is an upstream image
           # this workflow never builds, so it must still be fetchable.
           # No `--env-file`: see the note above.
@@ -477,6 +524,7 @@ jobs:
 
       - name: Smoke test
         env:
+          DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           HOST: ${{ secrets.HOST }}
           USERNAME: ${{ secrets.USERNAME }}

@@ -175,6 +175,39 @@ jobs:
           ssh-keygen -R "[${HOST}]:${SSH_PORT}" -f ~/.ssh/known_hosts >/dev/null 2>&1 || true
           cat "$RUNNER_TEMP/known_hosts" >> ~/.ssh/known_hosts
 
+      - name: Verify the runner can build
+        # No DOCKER_HOST, deliberately: this asks about THIS machine. The build
+        # runs here now, so the runner's daemon, cores and free disk are the
+        # build's preconditions -- and a runner with no local daemon has to fail
+        # here, in seconds, rather than part-way through a pnpm install.
+        #
+        # Stays after the SSH key step: no daemon-touching step may precede it.
+        run: |
+          set -eu
+          if ! docker version --format 'local daemon {{.Server.Version}}'; then
+            echo "::error::no local Docker daemon on this runner. The build runs here now, not on the staging host. Install dockerd on the runner, or point this job at a dedicated build host."
+            exit 1
+          fi
+          echo "cores: $(nproc)"
+          # The build cache lives on this machine now, so this is where
+          # cold-build headroom has to exist. BuildKit's out-of-space failures
+          # name everything except the cause.
+          avail=$(df --output=avail -B1 /var/lib/docker 2>/dev/null | tail -1) || avail=""
+          case "$avail" in
+            ''|*[!0-9]*)
+              echo "::warning::Could not read free space on the runner - check df -h there manually." ;;
+            *)
+              gb=$((avail / 1000000000))
+              if [ "$avail" -lt 15000000000 ]; then
+                echo "::error::Only ${gb} GB free on the runner. The build cache lives here now and a cold build needs more than that."
+                exit 1
+              elif [ "$avail" -lt 30000000000 ]; then
+                echo "::warning::${gb} GB free on the runner - enough for a cached build, tight for a cold one."
+              else
+                echo "OK - ${gb} GB free on the runner."
+              fi ;;
+          esac
+
       - name: Verify the paperclip-home guards
         # Plain SSH, never the inherited DOCKER_HOST: a DOCKER_HOST proxies the
         # Docker API, not a shell, so it has no way to stat a path on the host
@@ -286,9 +319,10 @@ jobs:
           esac
           echo "application secrets OK"
 
-      # Runs BEFORE the build: the build happens on this host, so free disk and
-      # a reachable daemon are preconditions of the build itself. A full disk
-      # must fail in seconds, not 28 minutes in.
+      # Runs before the transfer: the host must have room to receive the image
+      # and a reachable daemon. Nothing builds here any more, so this is no
+      # longer a precondition of the build itself -- but a full disk still has
+      # to fail before the image is streamed, not during.
       - name: Verify host preconditions
         env:
           DOCKER_HOST: ssh://${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ secrets.SSH_PORT || '22' }}
@@ -323,10 +357,10 @@ jobs:
             *)
               gb=$((avail / 1000000000))
               if [ "$avail" -lt 10000000000 ]; then
-                echo "::error::Only ${gb} GB free on the deploy host. A cold build needs more than that and fails obscurely when it runs out. See docs/deploy/trc-staging.md for what is safe to prune - note that pruning images also destroys rollback targets."
+                echo "::error::Only ${gb} GB free on the deploy host. Nothing builds here any more, but the incoming image load still needs room for the new image alongside the one running. See docs/deploy/trc-staging.md for what is safe to prune - note that pruning images also destroys rollback targets."
                 exit 1
-              elif [ "$avail" -lt 25000000000 ]; then
-                echo "::warning::${gb} GB free on the deploy host - enough for a cached build, tight for a cold one."
+              elif [ "$avail" -lt 20000000000 ]; then
+                echo "::warning::${gb} GB free on the deploy host - enough to receive an image, tight if it grows."
               else
                 echo "OK - ${gb} GB free on the deploy host."
               fi ;;

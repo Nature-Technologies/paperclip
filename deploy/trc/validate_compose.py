@@ -81,6 +81,7 @@ REMOTE_HOST_ENV_KEYS = ("DOCKER_HOST", "REMOTE_DOCKER_HOST")
 LOCAL_DAEMON_STEPS = {
     "Build the image on the runner",
     "Set up Buildx",
+    "Verify the runner can build",
 }
 # REMOTE: the staging host's daemon. Each must set its own DOCKER_HOST.
 REMOTE_DAEMON_STEPS = {
@@ -1188,6 +1189,36 @@ def check_deploy_workflow() -> None:
         "confirmation is what stops a truncated or silently failed transfer "
         "from reaching `compose up`",
     )
+
+    # The build's preconditions are the RUNNER's now. This has to run before the
+    # lockfile refresh, not just before the build: a runner with no local daemon
+    # cannot build at all, and that must cost seconds rather than a pnpm install
+    # followed by a failure with no obvious cause.
+    preflight_name = "Verify the runner can build"
+    preflight_step = _step_by_name(doc, preflight_name)
+    check(
+        preflight_step is not None,
+        f"no step named {preflight_name!r} -- the build runs on the runner now, "
+        "so its daemon and its free disk are preconditions of the build and "
+        "have to be proven before any work starts",
+    )
+    if preflight_step is not None:
+        preflight_lines = _script_lines(preflight_step.get("run") or "")
+        check(
+            any("docker version" in ln for ln in preflight_lines),
+            f"the {preflight_name!r} step must run `docker version` with no "
+            "DOCKER_HOST in scope -- that is what proves a LOCAL daemon exists "
+            "to build against",
+        )
+        lockfile_index = _step_index(doc, "Refresh lockfile for Docker build context")
+        preflight_index = _step_index(doc, preflight_name)
+        check(
+            None not in (lockfile_index, preflight_index)
+            and preflight_index < lockfile_index,
+            "the runner preflight must run before the lockfile refresh -- a "
+            "runner that cannot build should cost seconds, not a full pnpm "
+            "install first",
+        )
 
 
 def report() -> int:

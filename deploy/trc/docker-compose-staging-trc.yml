@@ -43,6 +43,14 @@ services:
   paperclip:
     image: ${PAPERCLIP_IMAGE:?PAPERCLIP_IMAGE must be set}
     container_name: paperclip
+    # The deploy workflow BUILDS this image straight into the deploy host's
+    # image store -- there is no registry in the loop any more. `never` makes a
+    # missing image fail closed instead of reaching out to GHCR, where the
+    # retired publish-then-pull scheme left tags that a rollback dispatch could
+    # otherwise silently start. Deliberately NOT set on postgres:
+    # postgres:17-alpine is an upstream image nothing here builds, so it must
+    # stay fetchable.
+    pull_policy: never
     networks: [poc-net]
     restart: unless-stopped
     depends_on:
